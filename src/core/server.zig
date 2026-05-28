@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
+const Io = std.Io;
 
 const http = @import("http.zig");
 const native_http = @import("native_http.zig");
@@ -47,46 +48,51 @@ pub const HttpServer = struct {
 
     pub fn start(self: *HttpServer) !void {
         const executor_count: u8 = @intCast(@max(self.options.io_threads, 1));
-        const runtime = try zio.Runtime.init(self.allocator, .{ .executors = .exact(executor_count) });
+        var runtime = try zio.Runtime.init(self.allocator, .{ .executors = .exact(executor_count) });
         defer runtime.deinit();
 
-        const addr = try zio.net.IpAddress.parseIp4(self.options.host, self.options.port);
-        const listener = try addr.listen(.{});
-        defer listener.close();
+        const io = runtime.io();
+        const addr = try Io.net.IpAddress.parseIp4(self.options.host, self.options.port);
+        var listener = try addr.listen(io, .{ .reuse_address = true });
+        defer listener.deinit(io);
 
         std.log.info("Zyra listening on {f}", .{listener.socket.address});
 
-        var group: zio.Group = .init;
-        defer group.cancel();
+        var group: Io.Group = .init;
+        defer group.cancel(io);
 
         while (true) {
-            const stream = try listener.accept(.{});
-            errdefer stream.close();
-            try group.spawn(handleClient, .{ self, stream });
+            const stream = try listener.accept(io);
+            errdefer stream.close(io);
+            try group.concurrent(io, handleClient, .{ self, io, stream });
         }
     }
 
-    fn handleClient(self: *HttpServer, stream: zio.net.Stream) !void {
-        defer stream.close();
-        defer stream.shutdown(.both) catch {};
-        stream.socket.setNoDelay(true) catch {};
+    fn handleClient(self: *HttpServer, io: Io, stream: Io.net.Stream) Io.Cancelable!void {
+        defer stream.close(io);
+        defer stream.shutdown(io, .both) catch {};
 
-        const read_buffer = try self.allocator.alloc(u8, self.options.max_request_header_size);
-        defer self.allocator.free(read_buffer);
-        var session_buffer: native_http.SessionBuffer = .{ .buf = read_buffer };
+        var io_read_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(io, &io_read_buffer);
+
+        var request_buffer: [64 * 1024]u8 = undefined;
+        var session_buffer: native_http.SessionBuffer = .{ .buf = &request_buffer };
+
+        var write_buffer: [4096]u8 = undefined;
+        var writer = stream.writer(io, &write_buffer);
 
         while (true) {
-            const parsed = session_buffer.readHead(stream, self.options.max_request_header_size) catch |err| switch (err) {
-                error.EndOfStream, error.ConnectionResetByPeer, error.ConnectionAborted => return,
+            const parsed = session_buffer.readHead(&reader.interface, self.options.max_request_header_size) catch |err| switch (err) {
+                error.EndOfStream => return,
                 error.HeaderTooLarge => {
-                    native_http.writeError(stream, .payload_too_large, "Request header too large");
+                    native_http.writeError(&writer.interface, .payload_too_large, "Request header too large");
                     return;
                 },
                 error.MalformedRequest => {
-                    native_http.writeError(stream, .bad_request, "Malformed HTTP request");
+                    native_http.writeError(&writer.interface, .bad_request, "Malformed HTTP request");
                     return;
                 },
-                else => return err,
+                error.ReadFailed => return cancelOrClose(reader.err),
             };
 
             var arena = self.memory_pool.requestArena();
@@ -105,16 +111,25 @@ pub const HttpServer = struct {
             var response = self.middleware_.execute(&self.router_, &request) catch http.HttpResponse.serverError();
             response.keep_alive = parsed.keep_alive;
             const skip_body = request.method == .head;
-            try native_http.writeResponse(stream, response, parsed.keep_alive, skip_body);
+            native_http.writeResponse(&writer.interface, response, parsed.keep_alive, skip_body) catch {
+                return cancelOrClose(writer.err);
+            };
 
-            try discardRequestBody(stream, &session_buffer, parsed);
+            discardRequestBody(&reader.interface, reader.err, &session_buffer, parsed) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+            };
 
             if (!parsed.keep_alive) break;
         }
     }
 };
 
-fn discardRequestBody(stream: zio.net.Stream, session_buffer: *native_http.SessionBuffer, parsed: native_http.ParsedRequest) !void {
+fn discardRequestBody(
+    reader: *std.Io.Reader,
+    reader_err: ?anyerror,
+    session_buffer: *native_http.SessionBuffer,
+    parsed: native_http.ParsedRequest,
+) Io.Cancelable!void {
     const content_length = parsed.content_length orelse {
         session_buffer.consume(parsed.header_bytes);
         return;
@@ -131,8 +146,18 @@ fn discardRequestBody(stream: zio.net.Stream, session_buffer: *native_http.Sessi
     var discard_buf: [4096]u8 = undefined;
     while (remaining > 0) {
         const want = @min(discard_buf.len, remaining);
-        const n = try stream.read(discard_buf[0..want], .none);
+        var data: [1][]u8 = .{discard_buf[0..want]};
+        const n = reader.readVec(&data) catch |err| switch (err) {
+            error.ReadFailed => return cancelOrClose(reader_err),
+            error.EndOfStream => return,
+        };
         if (n == 0) return;
         remaining -= n;
+    }
+}
+
+fn cancelOrClose(err: ?anyerror) Io.Cancelable!void {
+    if (err) |e| {
+        if (e == error.Canceled) return error.Canceled;
     }
 }

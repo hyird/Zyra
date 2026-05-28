@@ -1,5 +1,4 @@
 const std = @import("std");
-const zio = @import("zio");
 const http = @import("http.zig");
 
 const c = @cImport({
@@ -26,7 +25,7 @@ pub const SessionBuffer = struct {
     buf: []u8,
     used: usize = 0,
 
-    pub fn readHead(self: *SessionBuffer, stream: zio.net.Stream, max_header_size: usize) !ParsedRequest {
+    pub fn readHead(self: *SessionBuffer, reader: *std.Io.Reader, max_header_size: usize) !ParsedRequest {
         var previous_len: usize = 0;
 
         while (true) {
@@ -38,7 +37,8 @@ pub const SessionBuffer = struct {
             if (self.used >= self.buf.len) return error.HeaderTooLarge;
             if (self.used >= max_header_size) return error.HeaderTooLarge;
 
-            const n = try stream.read(self.buf[self.used..], .none);
+            var data: [1][]u8 = .{self.buf[self.used..]};
+            const n = try reader.readVec(&data);
             if (n == 0) return error.EndOfStream;
             self.used += n;
             if (self.used > max_header_size) return error.HeaderTooLarge;
@@ -102,7 +102,7 @@ fn parse(bytes: []u8, previous_len: usize) !?ParsedRequest {
     return parsed;
 }
 
-pub fn writeResponse(stream: zio.net.Stream, response: http.HttpResponse, keep_alive: bool, skip_body: bool) !void {
+pub fn writeResponse(writer_io: *std.Io.Writer, response: http.HttpResponse, keep_alive: bool, skip_body: bool) !void {
     var buffer: [1024]u8 = undefined;
     var writer: FixedBufferWriter = .init(&buffer);
 
@@ -110,22 +110,25 @@ pub fn writeResponse(stream: zio.net.Stream, response: http.HttpResponse, keep_a
 
     const head = writer.written();
     if (skip_body or response.body.len == 0) {
-        try stream.writeAll(head, .none);
+        try writer_io.writeAll(head);
+        try writer_io.flush();
         return;
     }
 
     if (writer.remaining() >= response.body.len) {
         try writer.writeAll(response.body);
-        try stream.writeAll(writer.written(), .none);
+        try writer_io.writeAll(writer.written());
+        try writer_io.flush();
         return;
     }
 
     var bufs: [2][]const u8 = .{ head, response.body };
-    try writeVecAll(stream, &bufs);
+    try writer_io.writeVecAll(&bufs);
+    try writer_io.flush();
 }
 
-pub fn writeError(stream: zio.net.Stream, status: http.HttpStatus, body: []const u8) void {
-    writeResponse(stream, .{ .status = status, .body = body }, false, false) catch {};
+pub fn writeError(writer_io: *std.Io.Writer, status: http.HttpStatus, body: []const u8) void {
+    writeResponse(writer_io, .{ .status = status, .body = body }, false, false) catch {};
 }
 
 fn reasonPhrase(status: http.HttpStatus) []const u8 {
@@ -191,35 +194,6 @@ const FixedBufferWriter = struct {
         self.len += out.len;
     }
 };
-
-fn writeVecAll(stream: zio.net.Stream, bufs: []const []const u8) !void {
-    var index: usize = 0;
-    var offset: usize = 0;
-
-    while (index < bufs.len) {
-        var current: [2][]const u8 = undefined;
-        var count: usize = 0;
-        current[count] = bufs[index][offset..];
-        count += 1;
-        if (index + 1 < bufs.len) {
-            current[count] = bufs[index + 1];
-            count += 1;
-        }
-
-        var written = try stream.writeVec(current[0..count], .none);
-        while (written > 0 and index < bufs.len) {
-            const remaining = bufs[index].len - offset;
-            if (written < remaining) {
-                offset += written;
-                written = 0;
-            } else {
-                written -= remaining;
-                index += 1;
-                offset = 0;
-            }
-        }
-    }
-}
 
 test "pico parser parses request" {
     var buf = "GET /hello?x=1 HTTP/1.1\r\nhost: example\r\n\r\n".*;
