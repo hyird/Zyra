@@ -1,0 +1,12 @@
+* text=auto eol=lf
+
+*.zig text eol=lf
+*.zon text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.txt text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf

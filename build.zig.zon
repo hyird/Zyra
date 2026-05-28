@@ -1,0 +1,19 @@
+.{
+    .name = .zyra,
+    .version = "0.1.0",
+    .fingerprint = 0x595a86815adb2481,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zio = .{
+            .url = "git+https://github.com/lalinsky/zio.git#db1a7072bd020fa6da92176f2ef3780a7e6a1c93",
+            .hash = "zio-0.12.1-xHbVVJbZHABrWrZfVMiSrtP6Y0EfrgecpCvA-Bbezqfj",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+    },
+}

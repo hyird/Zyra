@@ -1,0 +1,141 @@
+const std = @import("std");
+
+pub const Header = std.http.Header;
+
+pub const HttpMethod = enum {
+    get,
+    post,
+    put,
+    delete,
+    patch,
+    head,
+    options,
+    unknown,
+
+    pub fn fromStd(method: std.http.Method) HttpMethod {
+        return switch (method) {
+            .GET => .get,
+            .POST => .post,
+            .PUT => .put,
+            .DELETE => .delete,
+            .PATCH => .patch,
+            .HEAD => .head,
+            .OPTIONS => .options,
+            else => .unknown,
+        };
+    }
+};
+
+pub const HttpStatus = enum(u10) {
+    ok = 200,
+    created = 201,
+    no_content = 204,
+    bad_request = 400,
+    not_found = 404,
+    method_not_allowed = 405,
+    payload_too_large = 413,
+    internal_server_error = 500,
+
+    pub fn toStd(self: HttpStatus) std.http.Status {
+        return @enumFromInt(@intFromEnum(self));
+    }
+};
+
+pub const Params = std.StringHashMapUnmanaged([]const u8);
+
+pub const HttpRequest = struct {
+    allocator: std.mem.Allocator,
+    method: HttpMethod,
+    path: []const u8,
+    target: []const u8,
+    content_type: ?[]const u8 = null,
+    content_length: ?u64 = null,
+    keep_alive: bool = true,
+    params: Params = .{},
+
+    pub fn init(allocator: std.mem.Allocator, head: std.http.Server.Request.Head) HttpRequest {
+        const path = stripQuery(head.target);
+        return .{
+            .allocator = allocator,
+            .method = .fromStd(head.method),
+            .path = path,
+            .target = head.target,
+            .content_type = head.content_type,
+            .content_length = head.content_length,
+            .keep_alive = head.keep_alive,
+        };
+    }
+
+    pub fn deinit(self: *HttpRequest) void {
+        self.params.deinit(self.allocator);
+    }
+
+    pub fn setParam(self: *HttpRequest, name: []const u8, value: []const u8) !void {
+        try self.params.put(self.allocator, name, value);
+    }
+
+    pub fn param(self: *const HttpRequest, name: []const u8) ?[]const u8 {
+        return self.params.get(name);
+    }
+};
+
+pub const HttpResponse = struct {
+    status: HttpStatus = .ok,
+    body: []const u8 = "",
+    content_type: []const u8 = "text/plain; charset=utf-8",
+    extra_headers: []const Header = &.{},
+    keep_alive: bool = true,
+
+    pub fn ok(body: []const u8) HttpResponse {
+        return .{ .body = body };
+    }
+
+    pub fn text(body: []const u8) HttpResponse {
+        return .{ .body = body, .content_type = "text/plain; charset=utf-8" };
+    }
+
+    pub fn json(body: []const u8) HttpResponse {
+        return .{ .body = body, .content_type = "application/json" };
+    }
+
+    pub fn notFound() HttpResponse {
+        return .{ .status = .not_found, .body = "Not Found" };
+    }
+
+    pub fn methodNotAllowed(allow: []const u8) HttpResponse {
+        return .{
+            .status = .method_not_allowed,
+            .body = "Method Not Allowed",
+            .extra_headers = &.{.{ .name = "allow", .value = allow }},
+        };
+    }
+
+    pub fn serverError() HttpResponse {
+        return .{ .status = .internal_server_error, .body = "Internal Server Error" };
+    }
+
+    pub fn respond(self: HttpResponse, raw: *std.http.Server.Request) !void {
+        var headers_buf: [8]Header = undefined;
+        var count: usize = 0;
+        headers_buf[count] = .{ .name = "content-type", .value = self.content_type };
+        count += 1;
+        for (self.extra_headers) |header| {
+            if (count == headers_buf.len) break;
+            headers_buf[count] = header;
+            count += 1;
+        }
+        try raw.respond(self.body, .{
+            .status = self.status.toStd(),
+            .keep_alive = self.keep_alive,
+            .extra_headers = headers_buf[0..count],
+        });
+    }
+};
+
+fn stripQuery(target: []const u8) []const u8 {
+    return target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+}
+
+test "request path strips query" {
+    try std.testing.expectEqualStrings("/users", stripQuery("/users?page=1"));
+}

@@ -5,10 +5,9 @@
 #include <charconv>
 #include <cstdint>
 #include <iostream>
-#include <string_view>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
-#include <thread>
 
 namespace
 {
@@ -37,7 +36,7 @@ namespace
 
 int main(int argc, char** argv)
 {
-    uint16_t port = 3000;
+    uint16_t port = 3001;
     size_t threads = 2;
 
     for (int i = 1; i < argc; ++i)
@@ -71,10 +70,6 @@ int main(int argc, char** argv)
         hical::HttpResponse response;
         response.setBody("Hello from Hical\n", "text/plain");
         return response;
-    });
-
-    server.router().get("/json", [](const hical::HttpRequest&) -> hical::HttpResponse {
-        return hical::HttpResponse::json({{"message", "Hello from Hical"}, {"framework", "hical"}});
     });
 
     std::cout << "Hical benchmark server listening on http://127.0.0.1:" << port
