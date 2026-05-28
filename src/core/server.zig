@@ -109,9 +109,9 @@ pub const HttpServer = struct {
             defer request.deinit();
 
             var response = self.middleware_.execute(&self.router_, &request) catch http.HttpResponse.serverError();
-            response.keep_alive = parsed.keep_alive;
+            response.keep_alive = false;
             const skip_body = request.method == .head;
-            native_http.writeResponse(&writer.interface, response, parsed.keep_alive, skip_body) catch {
+            native_http.writeResponse(&writer.interface, response, false, skip_body) catch {
                 return cancelOrClose(writer.err);
             };
 
@@ -119,7 +119,7 @@ pub const HttpServer = struct {
                 error.Canceled => return error.Canceled,
             };
 
-            if (!parsed.keep_alive) break;
+            break;
         }
     }
 };
