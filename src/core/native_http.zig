@@ -91,18 +91,24 @@ fn parse(bytes: []u8, previous_len: usize) !?ParsedRequest {
     for (headers[0..num_headers]) |header| {
         const name = header.name[0..header.name_len];
         const value = header.value[0..header.value_len];
-        if (std.ascii.eqlIgnoreCase(name, "connection")) {
-            if (std.ascii.indexOfIgnoreCase(value, "close") != null) {
-                parsed.keep_alive = false;
-            } else if (std.ascii.indexOfIgnoreCase(value, "keep-alive") != null) {
-                parsed.keep_alive = true;
-            }
-        } else if (std.ascii.eqlIgnoreCase(name, "content-type")) {
-            parsed.content_type = value;
-        } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            parsed.content_length = std.fmt.parseInt(u64, value, 10) catch return error.MalformedRequest;
-        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-            parsed.has_transfer_encoding = true;
+        switch (name.len) {
+            10 => if ((name[0] == 'c' or name[0] == 'C') and std.ascii.eqlIgnoreCase(name, "connection")) {
+                if (std.ascii.indexOfIgnoreCase(value, "close") != null) {
+                    parsed.keep_alive = false;
+                } else if (std.ascii.indexOfIgnoreCase(value, "keep-alive") != null) {
+                    parsed.keep_alive = true;
+                }
+            },
+            12 => if ((name[0] == 'c' or name[0] == 'C') and std.ascii.eqlIgnoreCase(name, "content-type")) {
+                parsed.content_type = value;
+            },
+            14 => if ((name[0] == 'c' or name[0] == 'C') and std.ascii.eqlIgnoreCase(name, "content-length")) {
+                parsed.content_length = std.fmt.parseInt(u64, value, 10) catch return error.MalformedRequest;
+            },
+            17 => if ((name[0] == 't' or name[0] == 'T') and std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+                parsed.has_transfer_encoding = true;
+            },
+            else => {},
         }
     }
 
@@ -191,7 +197,9 @@ fn serializeHead(writer: *FixedBufferWriter, response: http.HttpResponse, prefix
         try writer.print("HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(response.status), reasonPhrase(response.status) });
     }
 
-    try writer.print("content-length: {d}\r\n", .{response.body.len});
+    try writer.writeAll("content-length: ");
+    try writer.writeUsize(response.body.len);
+    try writer.writeAll("\r\n");
     try writer.writeAll("content-type: ");
     try writer.writeAll(response.content_type);
     try writer.writeAll("\r\n");
@@ -227,6 +235,19 @@ const FixedBufferWriter = struct {
         if (bytes.len > self.remaining()) return error.NoSpaceLeft;
         @memcpy(self.buffer[self.len .. self.len + bytes.len], bytes);
         self.len += bytes.len;
+    }
+
+    fn writeUsize(self: *FixedBufferWriter, value: usize) !void {
+        var digits: [20]u8 = undefined;
+        var n = value;
+        var index = digits.len;
+        while (true) {
+            index -= 1;
+            digits[index] = '0' + @as(u8, @intCast(n % 10));
+            n /= 10;
+            if (n == 0) break;
+        }
+        try self.writeAll(digits[index..]);
     }
 
     fn print(self: *FixedBufferWriter, comptime fmt: []const u8, args: anytype) !void {

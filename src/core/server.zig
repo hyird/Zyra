@@ -21,7 +21,7 @@ pub const ServerOptions = struct {
     idle_timeout_ms: i64 = 60_000,
     /// 0 means unlimited, matching Hical's connection loop behavior.
     max_keep_alive_requests: usize = 0,
-    write_buffer_size: usize = 4096,
+    write_buffer_size: usize = 0,
 };
 
 pub const HttpServer = struct {
