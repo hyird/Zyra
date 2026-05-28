@@ -3,32 +3,40 @@ const http = @import("http.zig");
 
 pub const RouteHandler = *const fn (*http.HttpRequest) anyerror!http.HttpResponse;
 
+const method_count = @typeInfo(http.HttpMethod).@"enum".fields.len;
+
 const RouteEntry = struct {
-    method: http.HttpMethod,
     path: []const u8,
     handler: RouteHandler,
-    is_param: bool,
 };
 
 pub const Router = struct {
     allocator: std.mem.Allocator,
-    routes: std.ArrayListUnmanaged(RouteEntry) = .empty,
+    static_routes: [method_count]std.StringHashMapUnmanaged(RouteHandler) = .{std.StringHashMapUnmanaged(RouteHandler).empty} ** method_count,
+    param_routes: [method_count]std.ArrayListUnmanaged(RouteEntry) = .{std.ArrayListUnmanaged(RouteEntry).empty} ** method_count,
+    path_methods: std.StringHashMapUnmanaged(u16) = .{},
 
     pub fn init(allocator: std.mem.Allocator) Router {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *Router) void {
-        self.routes.deinit(self.allocator);
+        for (&self.static_routes) |*routes| routes.deinit(self.allocator);
+        for (&self.param_routes) |*routes| routes.deinit(self.allocator);
+        self.path_methods.deinit(self.allocator);
     }
 
     pub fn route(self: *Router, method: http.HttpMethod, path: []const u8, handler: RouteHandler) !void {
-        try self.routes.append(self.allocator, .{
-            .method = method,
-            .path = path,
-            .handler = handler,
-            .is_param = std.mem.indexOfScalar(u8, path, '{') != null,
-        });
+        const index = methodIndex(method);
+        if (isParamPath(path)) {
+            try self.param_routes[index].append(self.allocator, .{ .path = path, .handler = handler });
+        } else {
+            try self.static_routes[index].put(self.allocator, path, handler);
+        }
+
+        const bit = methodBit(method);
+        const result = try self.path_methods.getOrPut(self.allocator, path);
+        result.value_ptr.* = if (result.found_existing) result.value_ptr.* | bit else bit;
     }
 
     pub fn get(self: *Router, path: []const u8, handler: RouteHandler) !void {
@@ -40,33 +48,47 @@ pub const Router = struct {
     }
 
     pub fn dispatch(self: *const Router, req: *http.HttpRequest) !http.HttpResponse {
-        var method_allowed = false;
+        const index = methodIndex(req.method);
 
-        for (self.routes.items) |entry| {
-            if (entry.method != req.method) continue;
-            if (!entry.is_param and std.mem.eql(u8, entry.path, req.path)) {
-                return entry.handler(req);
-            }
-            if (entry.is_param and try matchParamPath(req.allocator, entry.path, req.path, req)) {
-                return entry.handler(req);
-            }
+        if (self.static_routes[index].get(req.path)) |handler| {
+            return handler(req);
         }
 
-        for (self.routes.items) |entry| {
-            if (entry.method == req.method) continue;
-            if ((!entry.is_param and std.mem.eql(u8, entry.path, req.path)) or
-                (entry.is_param and try pathShapeMatches(entry.path, req.path)))
-            {
-                method_allowed = true;
-                break;
-            }
+        for (self.param_routes[index].items) |entry| {
+            if (try matchParamPath(entry.path, req.path, req)) return entry.handler(req);
         }
 
-        return if (method_allowed) http.HttpResponse.methodNotAllowed("GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS") else http.HttpResponse.notFound();
+        if (self.path_methods.contains(req.path) or try self.paramPathExistsForOtherMethod(req)) {
+            return http.HttpResponse.methodNotAllowed("GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS");
+        }
+
+        return http.HttpResponse.notFound();
+    }
+
+    fn paramPathExistsForOtherMethod(self: *const Router, req: *const http.HttpRequest) !bool {
+        for (self.param_routes, 0..) |routes, index| {
+            if (index == methodIndex(req.method)) continue;
+            for (routes.items) |entry| {
+                if (try pathShapeMatches(entry.path, req.path)) return true;
+            }
+        }
+        return false;
     }
 };
 
-fn matchParamPath(allocator: std.mem.Allocator, pattern_raw: []const u8, path_raw: []const u8, req: *http.HttpRequest) !bool {
+fn methodIndex(method: http.HttpMethod) usize {
+    return @intFromEnum(method);
+}
+
+fn methodBit(method: http.HttpMethod) u16 {
+    return @as(u16, 1) << @intCast(methodIndex(method));
+}
+
+fn isParamPath(path: []const u8) bool {
+    return std.mem.indexOfScalar(u8, path, '{') != null;
+}
+
+fn matchParamPath(pattern_raw: []const u8, path_raw: []const u8, req: *http.HttpRequest) !bool {
     var pattern = trimLeadingSlash(pattern_raw);
     var path = trimLeadingSlash(path_raw);
 
@@ -77,10 +99,8 @@ fn matchParamPath(allocator: std.mem.Allocator, pattern_raw: []const u8, path_ra
 
         const p = p_seg.?;
         const r = r_seg.?;
-        if (p.len >= 3 and p[0] == '{' and p[p.len - 1] == '}') {
-            const name = try allocator.dupe(u8, p[1 .. p.len - 1]);
-            const value = try allocator.dupe(u8, r);
-            try req.setParam(name, value);
+        if (isParamSegment(p)) {
+            try req.setParam(p[1 .. p.len - 1], r);
         } else if (!std.mem.eql(u8, p, r)) {
             return false;
         }
@@ -98,9 +118,13 @@ fn pathShapeMatches(pattern_raw: []const u8, path_raw: []const u8) !bool {
         if (p_seg == null or r_seg == null) return false;
         const p = p_seg.?;
         const r = r_seg.?;
-        if (!(p.len >= 3 and p[0] == '{' and p[p.len - 1] == '}') and !std.mem.eql(u8, p, r)) return false;
+        if (!isParamSegment(p) and !std.mem.eql(u8, p, r)) return false;
     }
     return true;
+}
+
+fn isParamSegment(segment: []const u8) bool {
+    return segment.len >= 3 and segment[0] == '{' and segment[segment.len - 1] == '}';
 }
 
 fn trimLeadingSlash(value: []const u8) []const u8 {
@@ -119,6 +143,23 @@ test "parameter route matches" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var req: http.HttpRequest = .{ .allocator = arena.allocator(), .method = .get, .path = "/users/42", .target = "/users/42" };
-    try std.testing.expect(try matchParamPath(arena.allocator(), "/users/{id}", req.path, &req));
+    try std.testing.expect(try matchParamPath("/users/{id}", req.path, &req));
     try std.testing.expectEqualStrings("42", req.param("id").?);
+}
+
+test "static route dispatches through map" {
+    const handler = struct {
+        fn ok(_: *http.HttpRequest) !http.HttpResponse {
+            return http.HttpResponse.text("ok");
+        }
+    }.ok;
+
+    var router = Router.init(std.testing.allocator);
+    defer router.deinit();
+    try router.get("/", handler);
+
+    var req: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/", .target = "/" };
+    const res = try router.dispatch(&req);
+    try std.testing.expectEqual(http.HttpStatus.ok, res.status);
+    try std.testing.expectEqualStrings("ok", res.body);
 }

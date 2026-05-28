@@ -82,6 +82,7 @@ pub const HttpServer = struct {
         while (true) {
             const stream = try listener.accept(io);
             errdefer stream.close(io);
+            setNoDelay(stream);
             if (!self.tryAcquireConnection()) {
                 stream.close(io);
                 continue;
@@ -133,11 +134,30 @@ pub const HttpServer = struct {
         var io_read_buffer: [4096]u8 = undefined;
         var reader = stream.reader(io, &io_read_buffer);
 
-        var request_buffer: [64 * 1024]u8 = undefined;
-        var session_buffer: native_http.SessionBuffer = .{ .buf = &request_buffer };
+        var request_stack_buffer: [8 * 1024]u8 = undefined;
+        var request_heap_buffer: ?[]u8 = null;
+        defer if (request_heap_buffer) |buffer| self.allocator.free(buffer);
+        const request_buffer = if (self.options.max_request_header_size <= request_stack_buffer.len)
+            request_stack_buffer[0..]
+        else blk: {
+            const buffer = self.allocator.alloc(u8, self.options.max_request_header_size) catch return;
+            request_heap_buffer = buffer;
+            break :blk buffer;
+        };
+        var session_buffer: native_http.SessionBuffer = .{ .buf = request_buffer };
 
-        var write_buffer: [4096]u8 = undefined;
-        var writer = stream.writer(io, &write_buffer);
+        var write_stack_buffer: [4096]u8 = undefined;
+        var write_heap_buffer: ?[]u8 = null;
+        defer if (write_heap_buffer) |buffer| self.allocator.free(buffer);
+        const write_buffer = if (self.options.write_buffer_size <= write_stack_buffer.len)
+            write_stack_buffer[0..self.options.write_buffer_size]
+        else blk: {
+            const buffer = self.allocator.alloc(u8, self.options.write_buffer_size) catch return;
+            write_heap_buffer = buffer;
+            break :blk buffer;
+        };
+        var writer = stream.writer(io, write_buffer);
+        var response_prefix: native_http.ResponsePrefix = .{};
 
         var requests_handled: usize = 0;
         while (true) {
@@ -184,7 +204,7 @@ pub const HttpServer = struct {
                 var response = self.middleware_.execute(&self.router_, &request) catch http.HttpResponse.serverError();
                 response.keep_alive = keep_alive;
                 const skip_body = request.method == .head;
-                native_http.writeResponse(&writer.interface, response, keep_alive, skip_body) catch {
+                native_http.writeResponseWithPrefix(&writer.interface, response, response_prefix.bytes(io, keep_alive), skip_body) catch {
                     return cancelOrClose(writer.err);
                 };
             }
@@ -192,7 +212,7 @@ pub const HttpServer = struct {
 
             if (!keep_alive) break;
 
-            consumeReusableRequest(&session_buffer, parsed);
+            try discardReusableRequestBody(&reader.interface, reader.err, &session_buffer, parsed);
         }
     }
 };
@@ -203,6 +223,18 @@ fn scanIdleConnections(self: *HttpServer, io: Io) Io.Cancelable!void {
         try Io.Timeout.sleep(.{ .duration = .{ .raw = .fromMilliseconds(interval_ms), .clock = .awake } }, io);
         self.idle_tracker.closeExpired(io, self.options.idle_timeout_ms);
     }
+}
+
+fn setNoDelay(stream: Io.net.Stream) void {
+    if (builtin.os.tag == .windows) return;
+
+    const enabled: c_int = 1;
+    std.posix.setsockopt(
+        stream.socket.handle,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        std.mem.asBytes(&enabled),
+    ) catch {};
 }
 
 const IdleTracker = struct {
@@ -255,19 +287,41 @@ fn nowMs(io: Io) i64 {
 }
 
 fn requestBodyReusable(session_buffer: *const native_http.SessionBuffer, parsed: native_http.ParsedRequest) bool {
+    _ = session_buffer;
     if (parsed.has_transfer_encoding) return false;
-
-    const content_length = parsed.content_length orelse return true;
-    const available = session_buffer.used - parsed.header_bytes;
-    return @as(u64, @intCast(available)) >= content_length;
+    return true;
 }
 
-fn consumeReusableRequest(session_buffer: *native_http.SessionBuffer, parsed: native_http.ParsedRequest) void {
+fn discardReusableRequestBody(
+    reader: *std.Io.Reader,
+    reader_err: ?anyerror,
+    session_buffer: *native_http.SessionBuffer,
+    parsed: native_http.ParsedRequest,
+) Io.Cancelable!void {
     const content_length = parsed.content_length orelse {
         session_buffer.consume(parsed.header_bytes);
         return;
     };
-    session_buffer.consume(parsed.header_bytes + @as(usize, @intCast(content_length)));
+
+    const available = session_buffer.used - parsed.header_bytes;
+    if (@as(u64, @intCast(available)) >= content_length) {
+        session_buffer.consume(parsed.header_bytes + @as(usize, @intCast(content_length)));
+        return;
+    }
+
+    session_buffer.used = 0;
+    var remaining = content_length - available;
+    var discard_buffer: [4096]u8 = undefined;
+    while (remaining > 0) {
+        const want: usize = @intCast(@min(@as(u64, discard_buffer.len), remaining));
+        var data: [1][]u8 = .{discard_buffer[0..want]};
+        const n = reader.readVec(&data) catch |err| switch (err) {
+            error.ReadFailed => return cancelOrClose(reader_err),
+            error.EndOfStream => return,
+        };
+        if (n == 0) return;
+        remaining -= n;
+    }
 }
 
 fn cancelOrClose(err: ?anyerror) Io.Cancelable!void {

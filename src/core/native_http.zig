@@ -109,11 +109,43 @@ fn parse(bytes: []u8, previous_len: usize) !?ParsedRequest {
     return parsed;
 }
 
+pub const ResponsePrefix = struct {
+    buffer: [128]u8 = undefined,
+    len: usize = 0,
+    keep_alive: bool = false,
+    epoch_second: i64 = -1,
+
+    pub fn bytes(self: *ResponsePrefix, io: std.Io, keep_alive: bool) []const u8 {
+        const epoch_second = std.Io.Timestamp.now(io, .real).toSeconds();
+        if (self.len == 0 or self.keep_alive != keep_alive or self.epoch_second != epoch_second) {
+            self.rebuild(epoch_second, keep_alive);
+        }
+        return self.buffer[0..self.len];
+    }
+
+    fn rebuild(self: *ResponsePrefix, epoch_second: i64, keep_alive: bool) void {
+        var writer: FixedBufferWriter = .init(&self.buffer);
+        writer.writeAll("server: Zyra\r\n") catch unreachable;
+        writer.writeAll(if (keep_alive) "connection: keep-alive\r\n" else "connection: close\r\n") catch unreachable;
+        writer.writeAll("date: ") catch unreachable;
+        writeHttpDate(&writer, @intCast(@max(epoch_second, 0))) catch unreachable;
+        writer.writeAll("\r\n") catch unreachable;
+
+        self.len = writer.len;
+        self.keep_alive = keep_alive;
+        self.epoch_second = epoch_second;
+    }
+};
+
 pub fn writeResponse(writer_io: *std.Io.Writer, response: http.HttpResponse, keep_alive: bool, skip_body: bool) !void {
+    return writeResponseWithPrefix(writer_io, response, if (keep_alive) "connection: keep-alive\r\n" else "connection: close\r\n", skip_body);
+}
+
+pub fn writeResponseWithPrefix(writer_io: *std.Io.Writer, response: http.HttpResponse, prefix: []const u8, skip_body: bool) !void {
     var buffer: [1024]u8 = undefined;
     var writer: FixedBufferWriter = .init(&buffer);
 
-    try serializeHead(&writer, response, keep_alive);
+    try serializeHead(&writer, response, prefix);
 
     const head = writer.written();
     if (skip_body or response.body.len == 0) {
@@ -152,7 +184,7 @@ fn reasonPhrase(status: http.HttpStatus) []const u8 {
     };
 }
 
-fn serializeHead(writer: *FixedBufferWriter, response: http.HttpResponse, keep_alive: bool) !void {
+fn serializeHead(writer: *FixedBufferWriter, response: http.HttpResponse, prefix: []const u8) !void {
     if (response.status == .ok) {
         try writer.writeAll("HTTP/1.1 200 OK\r\n");
     } else {
@@ -163,7 +195,7 @@ fn serializeHead(writer: *FixedBufferWriter, response: http.HttpResponse, keep_a
     try writer.writeAll("content-type: ");
     try writer.writeAll(response.content_type);
     try writer.writeAll("\r\n");
-    try writer.writeAll(if (keep_alive) "connection: keep-alive\r\n" else "connection: close\r\n");
+    try writer.writeAll(prefix);
 
     for (response.extra_headers) |header| {
         try writer.writeAll(header.name);
@@ -202,6 +234,27 @@ const FixedBufferWriter = struct {
         self.len += out.len;
     }
 };
+
+fn writeHttpDate(writer: *FixedBufferWriter, epoch_seconds_raw: u64) !void {
+    const weekday_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
+    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = epoch_seconds_raw };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+
+    try writer.print("{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+        weekday_names[epoch_day.day % 7],
+        month_day.day_index + 1,
+        month_names[@intFromEnum(month_day.month) - 1],
+        year_day.year,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    });
+}
 
 test "pico parser parses request" {
     var buf = "GET /hello?x=1 HTTP/1.1\r\nhost: example\r\n\r\n".*;
