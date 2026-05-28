@@ -46,10 +46,109 @@ pub const SessionBuffer = struct {
         }
     }
 
+    pub fn readHeadDirect(self: *SessionBuffer, socket: *DirectSocket, max_header_size: usize) !ParsedRequest {
+        var previous_len: usize = 0;
+
+        while (true) {
+            if (self.used > previous_len) {
+                if (try parse(self.buf[0..self.used], previous_len)) |parsed| return parsed;
+                previous_len = self.used;
+            }
+
+            if (self.used >= self.buf.len) return error.HeaderTooLarge;
+            if (self.used >= max_header_size) return error.HeaderTooLarge;
+
+            const n = try socket.read(self.buf[self.used..]);
+            self.used += n;
+            if (self.used > max_header_size) return error.HeaderTooLarge;
+        }
+    }
+
     pub fn consume(self: *SessionBuffer, n: usize) void {
         const remaining = self.used - n;
         if (remaining > 0) std.mem.copyForwards(u8, self.buf[0..remaining], self.buf[n..self.used]);
         self.used = remaining;
+    }
+};
+
+pub const DirectSocket = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    read_err: ?std.Io.net.Stream.Reader.Error = null,
+    write_err: ?std.Io.net.Stream.Writer.Error = null,
+
+    pub fn init(io: std.Io, stream: std.Io.net.Stream) DirectSocket {
+        return .{ .io = io, .stream = stream };
+    }
+
+    pub fn read(self: *DirectSocket, dest: []u8) !usize {
+        std.debug.assert(dest.len > 0);
+        var data: [1][]u8 = .{dest};
+        const n = self.io.vtable.netRead(self.io.userdata, self.stream.socket.handle, &data) catch |err| {
+            self.read_err = err;
+            return error.ReadFailed;
+        };
+        if (n == 0) return error.EndOfStream;
+        return n;
+    }
+
+    pub fn writeAll(self: *DirectSocket, bytes: []const u8) !void {
+        var remaining = bytes;
+        while (remaining.len > 0) {
+            const n = self.io.vtable.netWrite(self.io.userdata, self.stream.socket.handle, "", &.{remaining}, 1) catch |err| {
+                self.write_err = err;
+                return error.WriteFailed;
+            };
+            if (n == 0) {
+                try self.io.vtable.checkCancel(self.io.userdata);
+                continue;
+            }
+            remaining = remaining[n..];
+        }
+    }
+
+    pub fn writeVecAll(self: *DirectSocket, bufs: []const []const u8) !void {
+        var index: usize = 0;
+        var offset: usize = 0;
+        while (index < bufs.len) {
+            while (index < bufs.len and offset == bufs[index].len) {
+                index += 1;
+                offset = 0;
+            }
+            if (index == bufs.len) return;
+
+            var slices: [8][]const u8 = undefined;
+            var count: usize = 0;
+            slices[count] = bufs[index][offset..];
+            count += 1;
+            var next = index + 1;
+            while (next < bufs.len and count < slices.len) : (next += 1) {
+                if (bufs[next].len == 0) continue;
+                slices[count] = bufs[next];
+                count += 1;
+            }
+
+            const n = self.io.vtable.netWrite(self.io.userdata, self.stream.socket.handle, "", slices[0..count], 1) catch |err| {
+                self.write_err = err;
+                return error.WriteFailed;
+            };
+            if (n == 0) {
+                try self.io.vtable.checkCancel(self.io.userdata);
+                continue;
+            }
+
+            var consumed = n;
+            while (consumed > 0) {
+                const available = bufs[index].len - offset;
+                if (consumed < available) {
+                    offset += consumed;
+                    break;
+                }
+                consumed -= available;
+                index += 1;
+                offset = 0;
+            }
+        }
     }
 };
 
@@ -172,8 +271,34 @@ pub fn writeResponseWithPrefix(writer_io: *std.Io.Writer, response: http.HttpRes
     try writer_io.flush();
 }
 
+pub fn writeResponseWithPrefixDirect(socket: *DirectSocket, response: http.HttpResponse, prefix: []const u8, skip_body: bool) !void {
+    var buffer: [1024]u8 = undefined;
+    var writer: FixedBufferWriter = .init(&buffer);
+
+    try serializeHead(&writer, response, prefix);
+
+    const head = writer.written();
+    if (skip_body or response.body.len == 0) {
+        try socket.writeAll(head);
+        return;
+    }
+
+    if (writer.remaining() >= response.body.len) {
+        try writer.writeAll(response.body);
+        try socket.writeAll(writer.written());
+        return;
+    }
+
+    var bufs: [2][]const u8 = .{ head, response.body };
+    try socket.writeVecAll(&bufs);
+}
+
 pub fn writeError(writer_io: *std.Io.Writer, status: http.HttpStatus, body: []const u8) void {
     writeResponse(writer_io, .{ .status = status, .body = body }, false, false) catch {};
+}
+
+pub fn writeErrorDirect(socket: *DirectSocket, status: http.HttpStatus, body: []const u8) void {
+    writeResponseWithPrefixDirect(socket, .{ .status = status, .body = body }, "connection: close\r\n", false) catch {};
 }
 
 fn reasonPhrase(status: http.HttpStatus) []const u8 {

@@ -22,6 +22,9 @@ pub const ServerOptions = struct {
     /// 0 means unlimited, matching Hical's connection loop behavior.
     max_keep_alive_requests: usize = 0,
     write_buffer_size: usize = 0,
+    /// Experimental: bypass std.Io.Reader/Writer buffering and call the std.Io
+    /// networking vtable directly. This still uses zio as the std.Io backend.
+    direct_socket_fast_path: bool = false,
 };
 
 pub const HttpServer = struct {
@@ -131,9 +134,6 @@ pub const HttpServer = struct {
         if (self.options.idle_timeout_ms > 0) self.idle_tracker.register(io, &idle_entry);
         defer if (self.options.idle_timeout_ms > 0) self.idle_tracker.unregister(io, &idle_entry);
 
-        var io_read_buffer: [4096]u8 = undefined;
-        var reader = stream.reader(io, &io_read_buffer);
-
         var request_stack_buffer: [8 * 1024]u8 = undefined;
         var request_heap_buffer: ?[]u8 = null;
         defer if (request_heap_buffer) |buffer| self.allocator.free(buffer);
@@ -145,6 +145,71 @@ pub const HttpServer = struct {
             break :blk buffer;
         };
         var session_buffer: native_http.SessionBuffer = .{ .buf = request_buffer };
+
+        if (self.options.direct_socket_fast_path) {
+            var socket = native_http.DirectSocket.init(io, stream);
+            var response_prefix: native_http.ResponsePrefix = .{};
+            var requests_handled: usize = 0;
+
+            while (true) {
+                const parsed = session_buffer.readHeadDirect(&socket, self.options.max_request_header_size) catch |err| switch (err) {
+                    error.EndOfStream => return,
+                    error.HeaderTooLarge => {
+                        native_http.writeErrorDirect(&socket, .request_header_fields_too_large, "Request header too large");
+                        return;
+                    },
+                    error.MalformedRequest => {
+                        native_http.writeErrorDirect(&socket, .bad_request, "Malformed HTTP request");
+                        return;
+                    },
+                    error.ReadFailed => return cancelOrClose(socket.read_err),
+                };
+                idle_entry.touch(io);
+
+                if (parsed.content_length) |content_length| {
+                    if (content_length > self.options.max_request_body_size) {
+                        native_http.writeErrorDirect(&socket, .payload_too_large, "Request body too large");
+                        return;
+                    }
+                }
+
+                requests_handled += 1;
+                const keep_alive = parsed.keep_alive and
+                    (self.options.max_keep_alive_requests == 0 or requests_handled < self.options.max_keep_alive_requests) and
+                    requestBodyReusable(&session_buffer, parsed);
+
+                {
+                    var arena = self.memory_pool.requestArena();
+                    defer arena.deinit();
+
+                    var request = http.HttpRequest.initParsed(
+                        arena.allocator(),
+                        parsed.method,
+                        parsed.target,
+                        parsed.content_type,
+                        parsed.content_length,
+                        parsed.keep_alive,
+                    );
+                    defer request.deinit();
+
+                    var response = self.middleware_.execute(&self.router_, &request) catch http.HttpResponse.serverError();
+                    response.keep_alive = keep_alive;
+                    const skip_body = request.method == .head;
+                    native_http.writeResponseWithPrefixDirect(&socket, response, response_prefix.bytes(io, keep_alive), skip_body) catch {
+                        return cancelOrClose(socket.write_err);
+                    };
+                }
+
+                if (!keep_alive) break;
+
+                try discardReusableRequestBodyDirect(&socket, &session_buffer, parsed);
+            }
+
+            return;
+        }
+
+        var io_read_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(io, &io_read_buffer);
 
         var write_stack_buffer: [4096]u8 = undefined;
         var write_heap_buffer: ?[]u8 = null;
@@ -318,6 +383,35 @@ fn discardReusableRequestBody(
             error.EndOfStream => return,
         };
         if (n == 0) return;
+        remaining -= n;
+    }
+}
+
+fn discardReusableRequestBodyDirect(
+    socket: *native_http.DirectSocket,
+    session_buffer: *native_http.SessionBuffer,
+    parsed: native_http.ParsedRequest,
+) Io.Cancelable!void {
+    const content_length = parsed.content_length orelse {
+        session_buffer.consume(parsed.header_bytes);
+        return;
+    };
+
+    const available = session_buffer.used - parsed.header_bytes;
+    if (@as(u64, @intCast(available)) >= content_length) {
+        session_buffer.consume(parsed.header_bytes + @as(usize, @intCast(content_length)));
+        return;
+    }
+
+    session_buffer.used = 0;
+    var remaining = content_length - available;
+    var discard_buffer: [4096]u8 = undefined;
+    while (remaining > 0) {
+        const want: usize = @intCast(@min(@as(u64, discard_buffer.len), remaining));
+        const n = socket.read(discard_buffer[0..want]) catch |err| switch (err) {
+            error.ReadFailed => return cancelOrClose(socket.read_err),
+            error.EndOfStream => return,
+        };
         remaining -= n;
     }
 }
