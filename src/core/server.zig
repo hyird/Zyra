@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const zio = @import("zio");
 const Io = std.Io;
 
@@ -47,7 +48,13 @@ pub const HttpServer = struct {
     }
 
     pub fn start(self: *HttpServer) !void {
-        const executor_count: u8 = @intCast(@max(self.options.io_threads, 1));
+        // zio's current Windows IOCP backend associates accepted sockets with
+        // the accepting executor's event loop. Keep socket reads/writes on that
+        // same executor until zio supports cross-executor socket I/O safely.
+        const executor_count: u8 = if (builtin.os.tag == .windows)
+            1
+        else
+            @intCast(@max(self.options.io_threads, 1));
         var runtime = try zio.Runtime.init(self.allocator, .{ .executors = .exact(executor_count) });
         defer runtime.deinit();
 
@@ -70,7 +77,6 @@ pub const HttpServer = struct {
 
     fn handleClient(self: *HttpServer, io: Io, stream: Io.net.Stream) Io.Cancelable!void {
         defer stream.close(io);
-        defer stream.shutdown(io, .both) catch {};
 
         var io_read_buffer: [4096]u8 = undefined;
         var reader = stream.reader(io, &io_read_buffer);
@@ -115,46 +121,12 @@ pub const HttpServer = struct {
                 return cancelOrClose(writer.err);
             };
 
-            discardRequestBody(&reader.interface, reader.err, &session_buffer, parsed) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-            };
-
+            // The response advertises `connection: close`; do not wait for a
+            // possibly incomplete request body before closing the connection.
             break;
         }
     }
 };
-
-fn discardRequestBody(
-    reader: *std.Io.Reader,
-    reader_err: ?anyerror,
-    session_buffer: *native_http.SessionBuffer,
-    parsed: native_http.ParsedRequest,
-) Io.Cancelable!void {
-    const content_length = parsed.content_length orelse {
-        session_buffer.consume(parsed.header_bytes);
-        return;
-    };
-
-    const available = session_buffer.used - parsed.header_bytes;
-    if (available >= content_length) {
-        session_buffer.consume(parsed.header_bytes + @as(usize, @intCast(content_length)));
-        return;
-    }
-
-    session_buffer.used = 0;
-    var remaining = content_length - available;
-    var discard_buf: [4096]u8 = undefined;
-    while (remaining > 0) {
-        const want = @min(discard_buf.len, remaining);
-        var data: [1][]u8 = .{discard_buf[0..want]};
-        const n = reader.readVec(&data) catch |err| switch (err) {
-            error.ReadFailed => return cancelOrClose(reader_err),
-            error.EndOfStream => return,
-        };
-        if (n == 0) return;
-        remaining -= n;
-    }
-}
 
 fn cancelOrClose(err: ?anyerror) Io.Cancelable!void {
     if (err) |e| {
