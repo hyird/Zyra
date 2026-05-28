@@ -208,8 +208,6 @@ pub const HttpServer = struct {
                     return cancelOrClose(writer.err);
                 };
             }
-            idle_entry.touch(io);
-
             if (!keep_alive) break;
 
             try discardReusableRequestBody(&reader.interface, reader.err, &session_buffer, parsed);

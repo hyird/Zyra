@@ -21,6 +21,8 @@ pub const MiddlewarePipeline = struct {
     }
 
     pub fn execute(self: *const MiddlewarePipeline, router: *const router_mod.Router, req: *http.HttpRequest) !http.HttpResponse {
+        if (self.entries.items.len == 0) return router.dispatch(req);
+
         for (self.entries.items) |middleware| {
             if (try middleware(req)) |response| return response;
         }
