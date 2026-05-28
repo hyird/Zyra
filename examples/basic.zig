@@ -16,7 +16,6 @@ pub fn main() !void {
         .io_threads = 2,
         .idle_timeout_ms = 30_000,
         .max_connections = 20_000,
-        .direct_socket_fast_path = true,
     });
     defer server.deinit();
 
