@@ -12,7 +12,9 @@ const MemoryPool = @import("memory_pool.zig").MemoryPool;
 pub const ServerOptions = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 3000,
-    io_threads: usize = 1,
+    /// Number of zio executors. 0 selects a platform default.
+    /// Windows is currently forced to 1 executor to avoid cross-IOCP socket I/O.
+    io_threads: usize = 0,
     max_request_header_size: usize = 64 * 1024,
     write_buffer_size: usize = 4096,
 };
@@ -51,10 +53,7 @@ pub const HttpServer = struct {
         // zio's current Windows IOCP backend associates accepted sockets with
         // the accepting executor's event loop. Keep socket reads/writes on that
         // same executor until zio supports cross-executor socket I/O safely.
-        const executor_count: u8 = if (builtin.os.tag == .windows)
-            1
-        else
-            @intCast(@max(self.options.io_threads, 1));
+        const executor_count = try self.executorCount();
         var runtime = try zio.Runtime.init(self.allocator, .{ .executors = .exact(executor_count) });
         defer runtime.deinit();
 
@@ -73,6 +72,16 @@ pub const HttpServer = struct {
             errdefer stream.close(io);
             try group.concurrent(io, handleClient, .{ self, io, stream });
         }
+    }
+
+    fn executorCount(self: *const HttpServer) !u8 {
+        if (builtin.os.tag == .windows) return 1;
+
+        const requested = if (self.options.io_threads == 0)
+            try std.Thread.getCpuCount()
+        else
+            self.options.io_threads;
+        return @intCast(@min(@max(requested, 1), std.math.maxInt(u8)));
     }
 
     fn handleClient(self: *HttpServer, io: Io, stream: Io.net.Stream) Io.Cancelable!void {
