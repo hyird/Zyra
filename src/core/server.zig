@@ -15,8 +15,12 @@ pub const ServerOptions = struct {
     /// Number of zio executors. 0 selects a platform default.
     /// Windows is currently forced to 1 executor to avoid cross-IOCP socket I/O.
     io_threads: usize = 0,
-    max_request_header_size: usize = 64 * 1024,
-    max_keep_alive_requests: usize = 1024,
+    max_request_header_size: usize = 8 * 1024,
+    max_request_body_size: u64 = 1024 * 1024,
+    max_connections: usize = 10_000,
+    idle_timeout_ms: i64 = 60_000,
+    /// 0 means unlimited, matching Hical's connection loop behavior.
+    max_keep_alive_requests: usize = 0,
     write_buffer_size: usize = 4096,
 };
 
@@ -26,6 +30,8 @@ pub const HttpServer = struct {
     router_: Router,
     middleware_: MiddlewarePipeline,
     memory_pool: MemoryPool,
+    active_connections: std.atomic.Value(usize),
+    idle_tracker: IdleTracker,
 
     pub fn init(allocator: std.mem.Allocator, options: ServerOptions) HttpServer {
         return .{
@@ -34,6 +40,8 @@ pub const HttpServer = struct {
             .router_ = Router.init(allocator),
             .middleware_ = MiddlewarePipeline.init(allocator),
             .memory_pool = MemoryPool.init(allocator),
+            .active_connections = .init(0),
+            .idle_tracker = .{},
         };
     }
 
@@ -67,12 +75,41 @@ pub const HttpServer = struct {
 
         var group: Io.Group = .init;
         defer group.cancel(io);
+        if (self.options.idle_timeout_ms > 0) {
+            try group.concurrent(io, scanIdleConnections, .{ self, io });
+        }
 
         while (true) {
             const stream = try listener.accept(io);
             errdefer stream.close(io);
+            if (!self.tryAcquireConnection()) {
+                stream.close(io);
+                continue;
+            }
+            errdefer self.releaseConnection();
             try group.concurrent(io, handleClient, .{ self, io, stream });
         }
+    }
+
+    fn tryAcquireConnection(self: *HttpServer) bool {
+        if (self.options.max_connections == 0) {
+            _ = self.active_connections.fetchAdd(1, .acq_rel);
+            return true;
+        }
+
+        var current = self.active_connections.load(.acquire);
+        while (current < self.options.max_connections) {
+            if (self.active_connections.cmpxchgWeak(current, current + 1, .acq_rel, .acquire)) |actual| {
+                current = actual;
+            } else {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn releaseConnection(self: *HttpServer) void {
+        _ = self.active_connections.fetchSub(1, .acq_rel);
     }
 
     fn executorCount(self: *const HttpServer) !u8 {
@@ -86,7 +123,12 @@ pub const HttpServer = struct {
     }
 
     fn handleClient(self: *HttpServer, io: Io, stream: Io.net.Stream) Io.Cancelable!void {
+        defer self.releaseConnection();
         defer stream.close(io);
+
+        var idle_entry: IdleTracker.Entry = .{ .stream = stream, .last_active_ms = .init(nowMs(io)) };
+        if (self.options.idle_timeout_ms > 0) self.idle_tracker.register(io, &idle_entry);
+        defer if (self.options.idle_timeout_ms > 0) self.idle_tracker.unregister(io, &idle_entry);
 
         var io_read_buffer: [4096]u8 = undefined;
         var reader = stream.reader(io, &io_read_buffer);
@@ -102,7 +144,7 @@ pub const HttpServer = struct {
             const parsed = session_buffer.readHead(&reader.interface, self.options.max_request_header_size) catch |err| switch (err) {
                 error.EndOfStream => return,
                 error.HeaderTooLarge => {
-                    native_http.writeError(&writer.interface, .payload_too_large, "Request header too large");
+                    native_http.writeError(&writer.interface, .request_header_fields_too_large, "Request header too large");
                     return;
                 },
                 error.MalformedRequest => {
@@ -111,10 +153,18 @@ pub const HttpServer = struct {
                 },
                 error.ReadFailed => return cancelOrClose(reader.err),
             };
+            idle_entry.touch(io);
+
+            if (parsed.content_length) |content_length| {
+                if (content_length > self.options.max_request_body_size) {
+                    native_http.writeError(&writer.interface, .payload_too_large, "Request body too large");
+                    return;
+                }
+            }
 
             requests_handled += 1;
             const keep_alive = parsed.keep_alive and
-                requests_handled < self.options.max_keep_alive_requests and
+                (self.options.max_keep_alive_requests == 0 or requests_handled < self.options.max_keep_alive_requests) and
                 requestBodyReusable(&session_buffer, parsed);
 
             {
@@ -138,6 +188,7 @@ pub const HttpServer = struct {
                     return cancelOrClose(writer.err);
                 };
             }
+            idle_entry.touch(io);
 
             if (!keep_alive) break;
 
@@ -145,6 +196,63 @@ pub const HttpServer = struct {
         }
     }
 };
+
+fn scanIdleConnections(self: *HttpServer, io: Io) Io.Cancelable!void {
+    const interval_ms = @max(@divTrunc(self.options.idle_timeout_ms, 4), 1000);
+    while (true) {
+        try Io.Timeout.sleep(.{ .duration = .{ .raw = .fromMilliseconds(interval_ms), .clock = .awake } }, io);
+        self.idle_tracker.closeExpired(io, self.options.idle_timeout_ms);
+    }
+}
+
+const IdleTracker = struct {
+    const List = std.DoublyLinkedList;
+
+    const Entry = struct {
+        node: List.Node = .{},
+        stream: Io.net.Stream,
+        last_active_ms: std.atomic.Value(i64),
+
+        fn touch(self: *Entry, io: Io) void {
+            self.last_active_ms.store(nowMs(io), .monotonic);
+        }
+    };
+
+    mutex: Io.Mutex = .init,
+    list: List = .{},
+
+    fn register(self: *IdleTracker, io: Io, entry: *Entry) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        entry.touch(io);
+        self.list.append(&entry.node);
+    }
+
+    fn unregister(self: *IdleTracker, io: Io, entry: *Entry) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.list.remove(&entry.node);
+    }
+
+    fn closeExpired(self: *IdleTracker, io: Io, timeout_ms: i64) void {
+        const now = nowMs(io);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        var node = self.list.first;
+        while (node) |current| {
+            node = current.next;
+            const entry: *Entry = @fieldParentPtr("node", current);
+            if (now - entry.last_active_ms.load(.monotonic) >= timeout_ms) {
+                entry.stream.close(io);
+            }
+        }
+    }
+};
+
+fn nowMs(io: Io) i64 {
+    return Io.Timestamp.now(io, .awake).toMilliseconds();
+}
 
 fn requestBodyReusable(session_buffer: *const native_http.SessionBuffer, parsed: native_http.ParsedRequest) bool {
     if (parsed.has_transfer_encoding) return false;

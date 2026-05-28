@@ -146,6 +146,7 @@ fn reasonPhrase(status: http.HttpStatus) []const u8 {
         .bad_request => "Bad Request",
         .not_found => "Not Found",
         .method_not_allowed => "Method Not Allowed",
+        .request_header_fields_too_large => "Request Header Fields Too Large",
         .payload_too_large => "Payload Too Large",
         .internal_server_error => "Internal Server Error",
     };

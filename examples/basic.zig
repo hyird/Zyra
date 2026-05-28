@@ -11,7 +11,12 @@ fn user(req: *zyra.HttpRequest) !zyra.HttpResponse {
 
 pub fn main() !void {
     const std = @import("std");
-    var server = zyra.HttpServer.init(std.heap.smp_allocator, .{ .port = 3000, .io_threads = 2 });
+    var server = zyra.HttpServer.init(std.heap.smp_allocator, .{
+        .port = 3000,
+        .io_threads = 2,
+        .idle_timeout_ms = 30_000,
+        .max_connections = 20_000,
+    });
     defer server.deinit();
 
     try server.router().get("/", index);
