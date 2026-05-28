@@ -145,16 +145,13 @@ jobs:
           cat >> "$GITHUB_STEP_SUMMARY" << 'HEREDOC'
           ## 📊 Zyra vs Hical — Benchmark
 
-          | Metric | **Zyra** | **Hical** |
-          |--------|----------|-----------|
+          | Request metric | **Zyra** | **Hical** |
+          |----------------|----------|-----------|
           HEREDOC
-          echo "| Server binary | $ZYRA_SIZE | $HICAL_SIZE |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Build time | ${ZYRA_BUILD_MS} ms | ${HICAL_BUILD_MS} ms |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Requests/sec** (wrk, 2t/100c/10s) | **${ZYRA_RPS}** | **${HICAL_RPS}** |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Avg latency** | **${ZYRA_LAT}** | **${HICAL_LAT}** |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **RAM usage** (under load) | **${ZYRA_RAM_MB} MB** | **${HICAL_RAM_MB} MB** |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "> Measured on GitHub Actions \`ubuntu-24.04\`. Load test: \`wrk -t2 -c100 -d10s\` against \`GET /\`. Zyra uses Zig 0.16 + zio; Hical is fetched from \`Hical61/Hical@main\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "> Measured on GitHub Actions \`ubuntu-24.04\`. Load test: \`wrk -t2 -c100 -d10s\` against \`GET /\`. Runtime-adjacent metrics such as binary size, build time, and RSS are intentionally excluded from the comparison table." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save benchmark JSON
         run: |
