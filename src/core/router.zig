@@ -55,7 +55,9 @@ pub const Router = struct {
         }
 
         for (self.param_routes[index].items) |entry| {
+            const checkpoint = req.paramCheckpoint();
             if (try matchParamPath(entry.path, req.path, req)) return entry.handler(req);
+            req.rollbackParams(checkpoint);
         }
 
         if (self.path_methods.contains(req.path) or try self.paramPathExistsForOtherMethod(req)) {

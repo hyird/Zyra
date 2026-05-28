@@ -55,6 +55,13 @@ pub const HttpStatus = enum(u10) {
 
 pub const Params = std.StringHashMapUnmanaged([]const u8);
 
+const max_inline_params = 8;
+
+pub const Param = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 pub const HttpRequest = struct {
     allocator: std.mem.Allocator,
     method: HttpMethod,
@@ -63,7 +70,9 @@ pub const HttpRequest = struct {
     content_type: ?[]const u8 = null,
     content_length: ?u64 = null,
     keep_alive: bool = true,
-    params: Params = .{},
+    inline_params: [max_inline_params]Param = undefined,
+    inline_param_count: u8 = 0,
+    overflow_params: Params = .{},
 
     pub fn initParsed(
         allocator: std.mem.Allocator,
@@ -98,15 +107,39 @@ pub const HttpRequest = struct {
     }
 
     pub fn deinit(self: *HttpRequest) void {
-        self.params.deinit(self.allocator);
+        self.overflow_params.deinit(self.allocator);
     }
 
     pub fn setParam(self: *HttpRequest, name: []const u8, value: []const u8) !void {
-        try self.params.put(self.allocator, name, value);
+        for (self.inline_params[0..self.inline_param_count]) |*param_entry| {
+            if (std.mem.eql(u8, param_entry.name, name)) {
+                param_entry.value = value;
+                return;
+            }
+        }
+
+        if (self.inline_param_count < max_inline_params) {
+            self.inline_params[self.inline_param_count] = .{ .name = name, .value = value };
+            self.inline_param_count += 1;
+            return;
+        }
+
+        try self.overflow_params.put(self.allocator, name, value);
     }
 
     pub fn param(self: *const HttpRequest, name: []const u8) ?[]const u8 {
-        return self.params.get(name);
+        for (self.inline_params[0..self.inline_param_count]) |param_entry| {
+            if (std.mem.eql(u8, param_entry.name, name)) return param_entry.value;
+        }
+        return self.overflow_params.get(name);
+    }
+
+    pub fn paramCheckpoint(self: *const HttpRequest) u8 {
+        return self.inline_param_count;
+    }
+
+    pub fn rollbackParams(self: *HttpRequest, checkpoint: u8) void {
+        self.inline_param_count = checkpoint;
     }
 };
 
