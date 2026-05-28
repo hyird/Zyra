@@ -17,6 +17,7 @@ pub const ParsedRequest = struct {
     minor_version: i32,
     content_type: ?[]const u8 = null,
     content_length: ?u64 = null,
+    has_transfer_encoding: bool = false,
     keep_alive: bool = true,
     header_bytes: usize,
 };
@@ -91,11 +92,17 @@ fn parse(bytes: []u8, previous_len: usize) !?ParsedRequest {
         const name = header.name[0..header.name_len];
         const value = header.value[0..header.value_len];
         if (std.ascii.eqlIgnoreCase(name, "connection")) {
-            parsed.keep_alive = !std.ascii.eqlIgnoreCase(value, "close");
+            if (std.ascii.indexOfIgnoreCase(value, "close") != null) {
+                parsed.keep_alive = false;
+            } else if (std.ascii.indexOfIgnoreCase(value, "keep-alive") != null) {
+                parsed.keep_alive = true;
+            }
         } else if (std.ascii.eqlIgnoreCase(name, "content-type")) {
             parsed.content_type = value;
         } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             parsed.content_length = std.fmt.parseInt(u64, value, 10) catch return error.MalformedRequest;
+        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            parsed.has_transfer_encoding = true;
         }
     }
 

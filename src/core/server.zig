@@ -16,6 +16,7 @@ pub const ServerOptions = struct {
     /// Windows is currently forced to 1 executor to avoid cross-IOCP socket I/O.
     io_threads: usize = 0,
     max_request_header_size: usize = 64 * 1024,
+    max_keep_alive_requests: usize = 1024,
     write_buffer_size: usize = 4096,
 };
 
@@ -96,6 +97,7 @@ pub const HttpServer = struct {
         var write_buffer: [4096]u8 = undefined;
         var writer = stream.writer(io, &write_buffer);
 
+        var requests_handled: usize = 0;
         while (true) {
             const parsed = session_buffer.readHead(&reader.interface, self.options.max_request_header_size) catch |err| switch (err) {
                 error.EndOfStream => return,
@@ -110,32 +112,55 @@ pub const HttpServer = struct {
                 error.ReadFailed => return cancelOrClose(reader.err),
             };
 
-            var arena = self.memory_pool.requestArena();
-            defer arena.deinit();
+            requests_handled += 1;
+            const keep_alive = parsed.keep_alive and
+                requests_handled < self.options.max_keep_alive_requests and
+                requestBodyReusable(&session_buffer, parsed);
 
-            var request = http.HttpRequest.initParsed(
-                arena.allocator(),
-                parsed.method,
-                parsed.target,
-                parsed.content_type,
-                parsed.content_length,
-                parsed.keep_alive,
-            );
-            defer request.deinit();
+            {
+                var arena = self.memory_pool.requestArena();
+                defer arena.deinit();
 
-            var response = self.middleware_.execute(&self.router_, &request) catch http.HttpResponse.serverError();
-            response.keep_alive = false;
-            const skip_body = request.method == .head;
-            native_http.writeResponse(&writer.interface, response, false, skip_body) catch {
-                return cancelOrClose(writer.err);
-            };
+                var request = http.HttpRequest.initParsed(
+                    arena.allocator(),
+                    parsed.method,
+                    parsed.target,
+                    parsed.content_type,
+                    parsed.content_length,
+                    parsed.keep_alive,
+                );
+                defer request.deinit();
 
-            // The response advertises `connection: close`; do not wait for a
-            // possibly incomplete request body before closing the connection.
-            break;
+                var response = self.middleware_.execute(&self.router_, &request) catch http.HttpResponse.serverError();
+                response.keep_alive = keep_alive;
+                const skip_body = request.method == .head;
+                native_http.writeResponse(&writer.interface, response, keep_alive, skip_body) catch {
+                    return cancelOrClose(writer.err);
+                };
+            }
+
+            if (!keep_alive) break;
+
+            consumeReusableRequest(&session_buffer, parsed);
         }
     }
 };
+
+fn requestBodyReusable(session_buffer: *const native_http.SessionBuffer, parsed: native_http.ParsedRequest) bool {
+    if (parsed.has_transfer_encoding) return false;
+
+    const content_length = parsed.content_length orelse return true;
+    const available = session_buffer.used - parsed.header_bytes;
+    return @as(u64, @intCast(available)) >= content_length;
+}
+
+fn consumeReusableRequest(session_buffer: *native_http.SessionBuffer, parsed: native_http.ParsedRequest) void {
+    const content_length = parsed.content_length orelse {
+        session_buffer.consume(parsed.header_bytes);
+        return;
+    };
+    session_buffer.consume(parsed.header_bytes + @as(usize, @intCast(content_length)));
+}
 
 fn cancelOrClose(err: ?anyerror) Io.Cancelable!void {
     if (err) |e| {
