@@ -2,6 +2,7 @@ const std = @import("std");
 const zio = @import("zio");
 
 const http = @import("http.zig");
+const native_http = @import("native_http.zig");
 const Router = @import("router.zig").Router;
 const MiddlewarePipeline = @import("middleware.zig").MiddlewarePipeline;
 const MemoryPool = @import("memory_pool.zig").MemoryPool;
@@ -71,32 +72,66 @@ pub const HttpServer = struct {
 
         const read_buffer = try self.allocator.alloc(u8, self.options.max_request_header_size);
         defer self.allocator.free(read_buffer);
-        var reader = stream.reader(read_buffer);
-
-        const write_buffer = try self.allocator.alloc(u8, self.options.write_buffer_size);
-        defer self.allocator.free(write_buffer);
-        var writer = stream.writer(write_buffer);
-
-        var raw_server = std.http.Server.init(&reader.interface, &writer.interface);
+        var session_buffer: native_http.SessionBuffer = .{ .buf = read_buffer };
 
         while (true) {
-            var raw_request = raw_server.receiveHead() catch |err| switch (err) {
-                error.ReadFailed => return reader.err orelse err,
-                error.HttpConnectionClosing => return,
+            const parsed = session_buffer.readHead(stream, self.options.max_request_header_size) catch |err| switch (err) {
+                error.EndOfStream, error.ConnectionResetByPeer, error.ConnectionAborted => return,
+                error.HeaderTooLarge => {
+                    native_http.writeError(stream, .payload_too_large, "Request header too large");
+                    return;
+                },
+                error.MalformedRequest => {
+                    native_http.writeError(stream, .bad_request, "Malformed HTTP request");
+                    return;
+                },
                 else => return err,
             };
 
             var arena = self.memory_pool.requestArena();
             defer arena.deinit();
 
-            var request = http.HttpRequest.init(arena.allocator(), raw_request.head);
+            var request = http.HttpRequest.initParsed(
+                arena.allocator(),
+                parsed.method,
+                parsed.target,
+                parsed.content_type,
+                parsed.content_length,
+                parsed.keep_alive,
+            );
             defer request.deinit();
 
             var response = self.middleware_.execute(&self.router_, &request) catch http.HttpResponse.serverError();
-            response.keep_alive = raw_request.head.keep_alive;
-            try response.respond(&raw_request);
+            response.keep_alive = parsed.keep_alive;
+            const skip_body = request.method == .head;
+            try native_http.writeResponse(stream, response, parsed.keep_alive, skip_body);
 
-            if (!raw_request.head.keep_alive) break;
+            try discardRequestBody(stream, &session_buffer, parsed);
+
+            if (!parsed.keep_alive) break;
         }
     }
 };
+
+fn discardRequestBody(stream: zio.net.Stream, session_buffer: *native_http.SessionBuffer, parsed: native_http.ParsedRequest) !void {
+    const content_length = parsed.content_length orelse {
+        session_buffer.consume(parsed.header_bytes);
+        return;
+    };
+
+    const available = session_buffer.used - parsed.header_bytes;
+    if (available >= content_length) {
+        session_buffer.consume(parsed.header_bytes + @as(usize, @intCast(content_length)));
+        return;
+    }
+
+    session_buffer.used = 0;
+    var remaining = content_length - available;
+    var discard_buf: [4096]u8 = undefined;
+    while (remaining > 0) {
+        const want = @min(discard_buf.len, remaining);
+        const n = try stream.read(discard_buf[0..want], .none);
+        if (n == 0) return;
+        remaining -= n;
+    }
+}

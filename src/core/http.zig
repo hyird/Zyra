@@ -12,6 +12,17 @@ pub const HttpMethod = enum {
     options,
     unknown,
 
+    pub fn fromBytes(method: []const u8) HttpMethod {
+        if (std.mem.eql(u8, method, "GET")) return .get;
+        if (std.mem.eql(u8, method, "POST")) return .post;
+        if (std.mem.eql(u8, method, "PUT")) return .put;
+        if (std.mem.eql(u8, method, "DELETE")) return .delete;
+        if (std.mem.eql(u8, method, "PATCH")) return .patch;
+        if (std.mem.eql(u8, method, "HEAD")) return .head;
+        if (std.mem.eql(u8, method, "OPTIONS")) return .options;
+        return .unknown;
+    }
+
     pub fn fromStd(method: std.http.Method) HttpMethod {
         return switch (method) {
             .GET => .get,
@@ -52,6 +63,25 @@ pub const HttpRequest = struct {
     content_length: ?u64 = null,
     keep_alive: bool = true,
     params: Params = .{},
+
+    pub fn initParsed(
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        target: []const u8,
+        content_type: ?[]const u8,
+        content_length: ?u64,
+        keep_alive: bool,
+    ) HttpRequest {
+        return .{
+            .allocator = allocator,
+            .method = .fromBytes(method),
+            .path = stripQuery(target),
+            .target = target,
+            .content_type = content_type,
+            .content_length = content_length,
+            .keep_alive = keep_alive,
+        };
+    }
 
     pub fn init(allocator: std.mem.Allocator, head: std.http.Server.Request.Head) HttpRequest {
         const path = stripQuery(head.target);
