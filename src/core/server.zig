@@ -4,7 +4,6 @@ const zio = @import("zio");
 const Io = std.Io;
 
 const http = @import("http.zig");
-const native_http = @import("native_http.zig");
 const Router = @import("router.zig").Router;
 const MiddlewarePipeline = @import("middleware.zig").MiddlewarePipeline;
 const MemoryPool = @import("memory_pool.zig").MemoryPool;
@@ -15,13 +14,8 @@ pub const ServerOptions = struct {
     /// Number of zio executors. 0 selects a platform default.
     /// Windows is currently forced to 1 executor to avoid cross-IOCP socket I/O.
     io_threads: usize = 0,
-    max_request_header_size: usize = 8 * 1024,
-    max_request_body_size: u64 = 1024 * 1024,
-    max_connections: usize = 10_000,
-    idle_timeout_ms: i64 = 60_000,
-    /// 0 means unlimited, matching Hical's connection loop behavior.
-    max_keep_alive_requests: usize = 0,
-    write_buffer_size: usize = 0,
+    max_request_header_size: usize = 64 * 1024,
+    write_buffer_size: usize = 4096,
 };
 
 pub const HttpServer = struct {
@@ -30,8 +24,6 @@ pub const HttpServer = struct {
     router_: Router,
     middleware_: MiddlewarePipeline,
     memory_pool: MemoryPool,
-    active_connections: std.atomic.Value(usize),
-    idle_tracker: IdleTracker,
 
     pub fn init(allocator: std.mem.Allocator, options: ServerOptions) HttpServer {
         return .{
@@ -40,8 +32,6 @@ pub const HttpServer = struct {
             .router_ = Router.init(allocator),
             .middleware_ = MiddlewarePipeline.init(allocator),
             .memory_pool = MemoryPool.init(allocator),
-            .active_connections = .init(0),
-            .idle_tracker = .{},
         };
     }
 
@@ -59,9 +49,6 @@ pub const HttpServer = struct {
     }
 
     pub fn start(self: *HttpServer) !void {
-        // zio's current Windows IOCP backend associates accepted sockets with
-        // the accepting executor's event loop. Keep socket reads/writes on that
-        // same executor until zio supports cross-executor socket I/O safely.
         const executor_count = try self.executorCount();
         var runtime = try zio.Runtime.init(self.allocator, .{ .executors = .exact(executor_count) });
         defer runtime.deinit();
@@ -75,42 +62,12 @@ pub const HttpServer = struct {
 
         var group: Io.Group = .init;
         defer group.cancel(io);
-        if (self.options.idle_timeout_ms > 0) {
-            try group.concurrent(io, scanIdleConnections, .{ self, io });
-        }
 
         while (true) {
             const stream = try listener.accept(io);
             errdefer stream.close(io);
-            setNoDelay(stream);
-            if (!self.tryAcquireConnection()) {
-                stream.close(io);
-                continue;
-            }
-            errdefer self.releaseConnection();
             try group.concurrent(io, handleClient, .{ self, io, stream });
         }
-    }
-
-    fn tryAcquireConnection(self: *HttpServer) bool {
-        if (self.options.max_connections == 0) {
-            _ = self.active_connections.fetchAdd(1, .acq_rel);
-            return true;
-        }
-
-        var current = self.active_connections.load(.acquire);
-        while (current < self.options.max_connections) {
-            if (self.active_connections.cmpxchgWeak(current, current + 1, .acq_rel, .acquire)) |actual| {
-                current = actual;
-            } else {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    fn releaseConnection(self: *HttpServer) void {
-        _ = self.active_connections.fetchSub(1, .acq_rel);
     }
 
     fn executorCount(self: *const HttpServer) !u8 {
@@ -124,203 +81,42 @@ pub const HttpServer = struct {
     }
 
     fn handleClient(self: *HttpServer, io: Io, stream: Io.net.Stream) Io.Cancelable!void {
-        defer self.releaseConnection();
         defer stream.close(io);
 
-        var idle_entry: IdleTracker.Entry = .{ .stream = stream, .last_active_ms = .init(nowMs(io)) };
-        if (self.options.idle_timeout_ms > 0) self.idle_tracker.register(io, &idle_entry);
-        defer if (self.options.idle_timeout_ms > 0) self.idle_tracker.unregister(io, &idle_entry);
+        const read_buffer = self.allocator.alloc(u8, self.options.max_request_header_size) catch return;
+        defer self.allocator.free(read_buffer);
+        var reader = stream.reader(io, read_buffer);
 
-        var io_read_buffer: [4096]u8 = undefined;
-        var reader = stream.reader(io, &io_read_buffer);
-
-        var request_stack_buffer: [8 * 1024]u8 = undefined;
-        var request_heap_buffer: ?[]u8 = null;
-        defer if (request_heap_buffer) |buffer| self.allocator.free(buffer);
-        const request_buffer = if (self.options.max_request_header_size <= request_stack_buffer.len)
-            request_stack_buffer[0..]
-        else blk: {
-            const buffer = self.allocator.alloc(u8, self.options.max_request_header_size) catch return;
-            request_heap_buffer = buffer;
-            break :blk buffer;
-        };
-        var session_buffer: native_http.SessionBuffer = .{ .buf = request_buffer };
-
-        var write_stack_buffer: [4096]u8 = undefined;
-        var write_heap_buffer: ?[]u8 = null;
-        defer if (write_heap_buffer) |buffer| self.allocator.free(buffer);
-        const write_buffer = if (self.options.write_buffer_size <= write_stack_buffer.len)
-            write_stack_buffer[0..self.options.write_buffer_size]
-        else blk: {
-            const buffer = self.allocator.alloc(u8, self.options.write_buffer_size) catch return;
-            write_heap_buffer = buffer;
-            break :blk buffer;
-        };
+        const write_buffer = self.allocator.alloc(u8, self.options.write_buffer_size) catch return;
+        defer self.allocator.free(write_buffer);
         var writer = stream.writer(io, write_buffer);
-        var response_prefix: native_http.ResponsePrefix = .{};
 
-        var requests_handled: usize = 0;
+        var raw_server = std.http.Server.init(&reader.interface, &writer.interface);
+
         while (true) {
-            const parsed = session_buffer.readHead(&reader.interface, self.options.max_request_header_size) catch |err| switch (err) {
-                error.EndOfStream => return,
-                error.HeaderTooLarge => {
-                    native_http.writeError(&writer.interface, .request_header_fields_too_large, "Request header too large");
-                    return;
-                },
-                error.MalformedRequest => {
-                    native_http.writeError(&writer.interface, .bad_request, "Malformed HTTP request");
-                    return;
-                },
+            var raw_request = raw_server.receiveHead() catch |err| switch (err) {
                 error.ReadFailed => return cancelOrClose(reader.err),
+                error.HttpConnectionClosing => return,
+                else => return,
             };
-            idle_entry.touch(io);
 
-            if (parsed.content_length) |content_length| {
-                if (content_length > self.options.max_request_body_size) {
-                    native_http.writeError(&writer.interface, .payload_too_large, "Request body too large");
-                    return;
-                }
-            }
+            var arena = self.memory_pool.requestArena();
+            defer arena.deinit();
 
-            requests_handled += 1;
-            const keep_alive = parsed.keep_alive and
-                (self.options.max_keep_alive_requests == 0 or requests_handled < self.options.max_keep_alive_requests) and
-                requestBodyReusable(&session_buffer, parsed);
+            var request = http.HttpRequest.init(arena.allocator(), raw_request.head);
+            defer request.deinit();
 
-            {
-                var arena = self.memory_pool.requestArena();
-                defer arena.deinit();
+            var response = self.middleware_.execute(&self.router_, &request) catch http.HttpResponse.serverError();
+            response.keep_alive = raw_request.head.keep_alive;
+            response.respond(&raw_request) catch |err| switch (err) {
+                error.WriteFailed => return cancelOrClose(writer.err),
+                else => return,
+            };
 
-                var request = http.HttpRequest.initParsed(
-                    arena.allocator(),
-                    parsed.method,
-                    parsed.target,
-                    parsed.content_type,
-                    parsed.content_length,
-                    parsed.keep_alive,
-                );
-                defer request.deinit();
-
-                var response = self.middleware_.execute(&self.router_, &request) catch http.HttpResponse.serverError();
-                response.keep_alive = keep_alive;
-                const skip_body = request.method == .head;
-                native_http.writeResponseWithPrefix(&writer.interface, response, response_prefix.bytes(io, keep_alive), skip_body) catch {
-                    return cancelOrClose(writer.err);
-                };
-            }
-            if (!keep_alive) break;
-
-            try discardReusableRequestBody(&reader.interface, reader.err, &session_buffer, parsed);
+            if (!raw_request.head.keep_alive) break;
         }
     }
 };
-
-fn scanIdleConnections(self: *HttpServer, io: Io) Io.Cancelable!void {
-    const interval_ms = @max(@divTrunc(self.options.idle_timeout_ms, 4), 1000);
-    while (true) {
-        try Io.Timeout.sleep(.{ .duration = .{ .raw = .fromMilliseconds(interval_ms), .clock = .awake } }, io);
-        self.idle_tracker.closeExpired(io, self.options.idle_timeout_ms);
-    }
-}
-
-fn setNoDelay(stream: Io.net.Stream) void {
-    if (builtin.os.tag == .windows) return;
-
-    const enabled: c_int = 1;
-    std.posix.setsockopt(
-        stream.socket.handle,
-        std.posix.IPPROTO.TCP,
-        std.posix.TCP.NODELAY,
-        std.mem.asBytes(&enabled),
-    ) catch {};
-}
-
-const IdleTracker = struct {
-    const List = std.DoublyLinkedList;
-
-    const Entry = struct {
-        node: List.Node = .{},
-        stream: Io.net.Stream,
-        last_active_ms: std.atomic.Value(i64),
-
-        fn touch(self: *Entry, io: Io) void {
-            self.last_active_ms.store(nowMs(io), .monotonic);
-        }
-    };
-
-    mutex: Io.Mutex = .init,
-    list: List = .{},
-
-    fn register(self: *IdleTracker, io: Io, entry: *Entry) void {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        entry.touch(io);
-        self.list.append(&entry.node);
-    }
-
-    fn unregister(self: *IdleTracker, io: Io, entry: *Entry) void {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        self.list.remove(&entry.node);
-    }
-
-    fn closeExpired(self: *IdleTracker, io: Io, timeout_ms: i64) void {
-        const now = nowMs(io);
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-
-        var node = self.list.first;
-        while (node) |current| {
-            node = current.next;
-            const entry: *Entry = @fieldParentPtr("node", current);
-            if (now - entry.last_active_ms.load(.monotonic) >= timeout_ms) {
-                entry.stream.close(io);
-            }
-        }
-    }
-};
-
-fn nowMs(io: Io) i64 {
-    return Io.Timestamp.now(io, .awake).toMilliseconds();
-}
-
-fn requestBodyReusable(session_buffer: *const native_http.SessionBuffer, parsed: native_http.ParsedRequest) bool {
-    _ = session_buffer;
-    if (parsed.has_transfer_encoding) return false;
-    return true;
-}
-
-fn discardReusableRequestBody(
-    reader: *std.Io.Reader,
-    reader_err: ?anyerror,
-    session_buffer: *native_http.SessionBuffer,
-    parsed: native_http.ParsedRequest,
-) Io.Cancelable!void {
-    const content_length = parsed.content_length orelse {
-        session_buffer.consume(parsed.header_bytes);
-        return;
-    };
-
-    const available = session_buffer.used - parsed.header_bytes;
-    if (@as(u64, @intCast(available)) >= content_length) {
-        session_buffer.consume(parsed.header_bytes + @as(usize, @intCast(content_length)));
-        return;
-    }
-
-    session_buffer.used = 0;
-    var remaining = content_length - available;
-    var discard_buffer: [4096]u8 = undefined;
-    while (remaining > 0) {
-        const want: usize = @intCast(@min(@as(u64, discard_buffer.len), remaining));
-        var data: [1][]u8 = .{discard_buffer[0..want]};
-        const n = reader.readVec(&data) catch |err| switch (err) {
-            error.ReadFailed => return cancelOrClose(reader_err),
-            error.EndOfStream => return,
-        };
-        if (n == 0) return;
-        remaining -= n;
-    }
-}
 
 fn cancelOrClose(err: ?anyerror) Io.Cancelable!void {
     if (err) |e| {

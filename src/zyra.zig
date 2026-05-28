@@ -15,8 +15,6 @@ pub const Router = @import("core/router.zig").Router;
 pub const MiddlewarePipeline = @import("core/middleware.zig").MiddlewarePipeline;
 pub const HttpServer = @import("core/server.zig").HttpServer;
 pub const MemoryPool = @import("core/memory_pool.zig").MemoryPool;
-pub const native_http = @import("core/native_http.zig");
-
 pub const zio_backend = @import("io/zio_backend.zig");
 
 test {
@@ -25,5 +23,4 @@ test {
     _ = MiddlewarePipeline;
     _ = HttpServer;
     _ = MemoryPool;
-    _ = native_http;
 }

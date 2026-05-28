@@ -15,7 +15,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     zyra_mod.addImport("zio", zio_dep.module("zio"));
-    zyra_mod.addIncludePath(b.path("third_party/picohttpparser"));
 
     const demo = b.addExecutable(.{
         .name = "zyra-demo",
@@ -27,8 +26,6 @@ pub fn build(b: *std.Build) void {
     });
     demo.root_module.addImport("zyra", zyra_mod);
     demo.root_module.addImport("zio", zio_dep.module("zio"));
-    demo.root_module.addCSourceFile(.{ .file = b.path("third_party/picohttpparser/picohttpparser.c") });
-    demo.root_module.linkSystemLibrary("c", .{});
     b.installArtifact(demo);
 
     const run_demo = b.addRunArtifact(demo);
@@ -44,9 +41,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.addImport("zio", zio_dep.module("zio"));
-    tests.root_module.addIncludePath(b.path("third_party/picohttpparser"));
-    tests.root_module.addCSourceFile(.{ .file = b.path("third_party/picohttpparser/picohttpparser.c") });
-    tests.root_module.linkSystemLibrary("c", .{});
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
