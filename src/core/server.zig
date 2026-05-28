@@ -69,6 +69,7 @@ pub const HttpServer = struct {
     fn handleClient(self: *HttpServer, stream: zio.net.Stream) !void {
         defer stream.close();
         defer stream.shutdown(.both) catch {};
+        stream.socket.setNoDelay(true) catch {};
 
         const read_buffer = try self.allocator.alloc(u8, self.options.max_request_header_size);
         defer self.allocator.free(read_buffer);

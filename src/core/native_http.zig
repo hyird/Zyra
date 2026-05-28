@@ -103,20 +103,25 @@ fn parse(bytes: []u8, previous_len: usize) !?ParsedRequest {
 }
 
 pub fn writeResponse(stream: zio.net.Stream, response: http.HttpResponse, keep_alive: bool, skip_body: bool) !void {
-    var header_buf: [1024]u8 = undefined;
-    var out = std.Io.Writer.fixed(&header_buf);
+    var buffer: [1024]u8 = undefined;
+    var writer: FixedBufferWriter = .init(&buffer);
 
-    try out.print("HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(response.status), reasonPhrase(response.status) });
-    try out.print("content-length: {d}\r\n", .{if (skip_body) 0 else response.body.len});
-    try out.print("content-type: {s}\r\n", .{response.content_type});
-    try out.writeAll(if (keep_alive) "connection: keep-alive\r\n" else "connection: close\r\n");
-    for (response.extra_headers) |header| {
-        try out.print("{s}: {s}\r\n", .{ header.name, header.value });
+    try serializeHead(&writer, response, keep_alive);
+
+    const head = writer.written();
+    if (skip_body or response.body.len == 0) {
+        try stream.writeAll(head, .none);
+        return;
     }
-    try out.writeAll("\r\n");
 
-    try stream.writeAll(out.buffered(), .none);
-    if (!skip_body and response.body.len > 0) try stream.writeAll(response.body, .none);
+    if (writer.remaining() >= response.body.len) {
+        try writer.writeAll(response.body);
+        try stream.writeAll(writer.written(), .none);
+        return;
+    }
+
+    var bufs: [2][]const u8 = .{ head, response.body };
+    try writeVecAll(stream, &bufs);
 }
 
 pub fn writeError(stream: zio.net.Stream, status: http.HttpStatus, body: []const u8) void {
@@ -134,6 +139,86 @@ fn reasonPhrase(status: http.HttpStatus) []const u8 {
         .payload_too_large => "Payload Too Large",
         .internal_server_error => "Internal Server Error",
     };
+}
+
+fn serializeHead(writer: *FixedBufferWriter, response: http.HttpResponse, keep_alive: bool) !void {
+    if (response.status == .ok) {
+        try writer.writeAll("HTTP/1.1 200 OK\r\n");
+    } else {
+        try writer.print("HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(response.status), reasonPhrase(response.status) });
+    }
+
+    try writer.print("content-length: {d}\r\n", .{response.body.len});
+    try writer.writeAll("content-type: ");
+    try writer.writeAll(response.content_type);
+    try writer.writeAll("\r\n");
+    try writer.writeAll(if (keep_alive) "connection: keep-alive\r\n" else "connection: close\r\n");
+
+    for (response.extra_headers) |header| {
+        try writer.writeAll(header.name);
+        try writer.writeAll(": ");
+        try writer.writeAll(header.value);
+        try writer.writeAll("\r\n");
+    }
+
+    try writer.writeAll("\r\n");
+}
+
+const FixedBufferWriter = struct {
+    buffer: []u8,
+    len: usize = 0,
+
+    fn init(buffer: []u8) FixedBufferWriter {
+        return .{ .buffer = buffer };
+    }
+
+    fn written(self: *const FixedBufferWriter) []const u8 {
+        return self.buffer[0..self.len];
+    }
+
+    fn remaining(self: *const FixedBufferWriter) usize {
+        return self.buffer.len - self.len;
+    }
+
+    fn writeAll(self: *FixedBufferWriter, bytes: []const u8) !void {
+        if (bytes.len > self.remaining()) return error.NoSpaceLeft;
+        @memcpy(self.buffer[self.len .. self.len + bytes.len], bytes);
+        self.len += bytes.len;
+    }
+
+    fn print(self: *FixedBufferWriter, comptime fmt: []const u8, args: anytype) !void {
+        const out = try std.fmt.bufPrint(self.buffer[self.len..], fmt, args);
+        self.len += out.len;
+    }
+};
+
+fn writeVecAll(stream: zio.net.Stream, bufs: []const []const u8) !void {
+    var index: usize = 0;
+    var offset: usize = 0;
+
+    while (index < bufs.len) {
+        var current: [2][]const u8 = undefined;
+        var count: usize = 0;
+        current[count] = bufs[index][offset..];
+        count += 1;
+        if (index + 1 < bufs.len) {
+            current[count] = bufs[index + 1];
+            count += 1;
+        }
+
+        var written = try stream.writeVec(current[0..count], .none);
+        while (written > 0 and index < bufs.len) {
+            const remaining = bufs[index].len - offset;
+            if (written < remaining) {
+                offset += written;
+                written = 0;
+            } else {
+                written -= remaining;
+                index += 1;
+                offset = 0;
+            }
+        }
+    }
 }
 
 test "pico parser parses request" {
