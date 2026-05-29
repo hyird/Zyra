@@ -26,6 +26,8 @@ const TypedRouteRecord = struct {
 const RuntimeOptions = @typeInfo(@TypeOf(zio.Runtime.init)).@"fn".params[1].type.?;
 const ExecutorCount = @FieldType(RuntimeOptions, "executors");
 
+pub const ErrorHandler = *const fn (?*anyopaque, *http.HttpRequest, anyerror) anyerror!http.HttpResponse;
+
 pub const ServerOptions = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 3000,
@@ -67,6 +69,10 @@ pub const HttpServer = struct {
     /// 资源（如 `FileSink`/`AsyncFileSink` 日志 sink）。`ctx` 原样回传。
     on_ready_ctx: ?*anyopaque = null,
     on_ready_fn: ?*const fn (?*anyopaque, Io) anyerror!void = null,
+    /// 可选的全局错误处理器：当业务 handler / 中间件返回 error 时调用，用于
+    /// 将服务层错误统一映射为 HTTP 响应。未设置时保持默认 500。
+    error_handler_ctx: ?*anyopaque = null,
+    error_handler_fn: ?ErrorHandler = null,
 
     pub fn init(allocator: std.mem.Allocator, options: ServerOptions) HttpServer {
         return .{
@@ -262,6 +268,14 @@ pub const HttpServer = struct {
         self.on_ready_fn = handler;
     }
 
+    /// 设置全局错误处理器。业务处理函数或中间件可以直接返回 error；服务器会
+    /// 调用该 handler，把 `(req, err)` 映射成 HTTP 响应。若错误处理器自身失败，
+    /// 则回退到默认的 500 响应。
+    pub fn setErrorHandler(self: *HttpServer, ctx: ?*anyopaque, handler: ErrorHandler) void {
+        self.error_handler_ctx = ctx;
+        self.error_handler_fn = handler;
+    }
+
     /// 请求优雅关闭：停止接收新连接，并在 `start` 返回前让进行中的请求
     /// 完成。线程安全；可从其他 fiber/线程调用（例如信号处理桥接）。
     pub fn requestShutdown(self: *HttpServer, io: Io) void {
@@ -442,7 +456,7 @@ pub const HttpServer = struct {
                 }
             }
 
-            var response = self.middleware_.execute(&self.router_, &request) catch http.HttpResponse.serverError();
+            var response = self.middleware_.execute(&self.router_, &request) catch |err| self.handleError(&request, err);
             response.keep_alive = keep_alive;
             response.respondWithIo(&raw_request, io) catch |err| switch (err) {
                 error.WriteFailed => return cancelOrClose(writer.err),
@@ -451,6 +465,13 @@ pub const HttpServer = struct {
 
             if (!keep_alive) break;
         }
+    }
+
+    fn handleError(self: *HttpServer, req: *http.HttpRequest, err: anyerror) http.HttpResponse {
+        if (self.error_handler_fn) |handler| {
+            return handler(self.error_handler_ctx, req, err) catch http.HttpResponse.serverError();
+        }
+        return http.HttpResponse.serverError();
     }
 
     /// 完成 WebSocket 握手并运行已注册的处理函数。
@@ -611,6 +632,74 @@ test "enableOpenApi generates and caches a document" {
     const parsed2 = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, server.openapi_json.?, .{});
     defer parsed2.deinit();
     try std.testing.expectEqualStrings("Replaced", parsed2.value.object.get("info").?.object.get("title").?.string);
+}
+
+test "setErrorHandler maps service errors to HTTP responses" {
+    const ErrorState = struct {
+        seen_error: ?anyerror = null,
+        seen_path: []const u8 = "",
+    };
+
+    const mapper = struct {
+        fn handle(ctx: ?*anyopaque, req: *http.HttpRequest, err: anyerror) anyerror!http.HttpResponse {
+            const state: *ErrorState = @ptrCast(@alignCast(ctx.?));
+            state.seen_error = err;
+            state.seen_path = req.path;
+            return switch (err) {
+                error.Unauthorized => .{ .status = .unauthorized, .body = "Unauthorized" },
+                error.Forbidden => .{ .status = .forbidden, .body = "Forbidden" },
+                else => http.HttpResponse.serverError(),
+            };
+        }
+    }.handle;
+
+    var state = ErrorState{};
+    var server = HttpServer.init(std.testing.allocator, .{});
+    defer server.deinit();
+    server.setErrorHandler(&state, mapper);
+
+    const handler = struct {
+        fn private(_: *http.HttpRequest) anyerror!http.HttpResponse {
+            return error.Unauthorized;
+        }
+    }.private;
+    try server.router().get("/private", handler);
+
+    var req: http.HttpRequest = .{
+        .allocator = std.testing.allocator,
+        .method = .get,
+        .path = "/private",
+        .target = "/private",
+    };
+
+    const response = server.middleware_.execute(&server.router_, &req) catch |err| server.handleError(&req, err);
+    try std.testing.expectEqual(http.HttpStatus.unauthorized, response.status);
+    try std.testing.expectEqualStrings("Unauthorized", response.body);
+    try std.testing.expectEqual(error.Unauthorized, state.seen_error.?);
+    try std.testing.expectEqualStrings("/private", state.seen_path);
+}
+
+test "error handler failure falls back to 500" {
+    const mapper = struct {
+        fn handle(_: ?*anyopaque, _: *http.HttpRequest, _: anyerror) anyerror!http.HttpResponse {
+            return error.MapperFailed;
+        }
+    }.handle;
+
+    var server = HttpServer.init(std.testing.allocator, .{});
+    defer server.deinit();
+    server.setErrorHandler(null, mapper);
+
+    var req: http.HttpRequest = .{
+        .allocator = std.testing.allocator,
+        .method = .get,
+        .path = "/boom",
+        .target = "/boom",
+    };
+
+    const response = server.handleError(&req, error.Boom);
+    try std.testing.expectEqual(http.HttpStatus.internal_server_error, response.status);
+    try std.testing.expectEqualStrings("Internal Server Error", response.body);
 }
 
 const TypedTestBody = struct { name: []const u8, count: u32 };

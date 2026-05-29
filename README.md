@@ -43,6 +43,11 @@ zig build run-logging     # 异步文件日志（AsyncFileSink，经 onReady 启
   `setBody`、`bodyText`、`jsonValue`、`setJsonBody`、`badRequest`、`redirect`、
   `setCookie`，以及 416 范围错误工厂
 - 服务器限制设置器：请求体/请求头大小和最大连接数
+- 全局错误处理器：`server.setErrorHandler(ctx, handler)` 将业务 handler 或
+  中间件返回的 `error` 统一映射为 HTTP 响应；未设置时默认返回 500。handler
+  形如 `fn(?*anyopaque, *HttpRequest, anyerror) anyerror!HttpResponse`，因此
+  service 层可以直接 `return error.Unauthorized` / `error.Forbidden` 等，由
+  应用集中决定状态码和响应体
 - 中间件：通过 `MiddlewarePipeline` 实现的同步洋葱模型
   （`use`/`useOnion`/`useBeforeAfter`），包含 `MiddlewareHandler`、
   `BeforeHandler`、`AfterHandler` 和 `Next`

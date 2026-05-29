@@ -28,6 +28,7 @@ pub const BeforeHandler = @import("core/middleware.zig").BeforeHandler;
 pub const AfterHandler = @import("core/middleware.zig").AfterHandler;
 pub const Next = @import("core/middleware.zig").Next;
 pub const HttpServer = @import("core/server.zig").HttpServer;
+pub const ErrorHandler = @import("core/server.zig").ErrorHandler;
 pub const MemoryPool = @import("core/memory_pool.zig").MemoryPool;
 pub const multipart = @import("core/multipart.zig");
 pub const static_files = @import("core/static_files.zig");
