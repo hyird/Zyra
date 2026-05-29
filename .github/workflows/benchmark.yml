@@ -11,9 +11,9 @@ permissions:
   contents: read
 
 jobs:
-  benchmark:
+  benchmark-zyra:
     runs-on: ubuntu-24.04
-    name: Build & load comparison
+    name: Benchmark Zyra
 
     steps:
       - name: Checkout
@@ -28,13 +28,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake \
-            ninja-build \
-            gcc-14 \
-            g++-14 \
-            libboost-all-dev \
-            libssl-dev \
-            zlib1g-dev \
             wrk \
             curl
 
@@ -85,7 +78,62 @@ jobs:
 
           kill "$ZYRA_PID" 2>/dev/null || true
           trap - EXIT
-          sleep 1
+
+      - name: Save Zyra benchmark JSON
+        run: |
+          mkdir -p benchmarks
+          python3 << 'PYEOF'
+          import json, os, time
+
+          data = {
+              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "runner": "ubuntu-24.04",
+              "tool": "wrk -t2 -c100 -d10s",
+              "zyra": {
+                  "url": "http://127.0.0.1:3000/",
+                  "requests_per_sec": float(os.environ.get("ZYRA_RPS", "0")),
+                  "avg_latency": os.environ.get("ZYRA_LAT", ""),
+                  "ram_mb": float(os.environ.get("ZYRA_RAM_MB", "0")),
+                  "build_time_ms": int(os.environ.get("ZYRA_BUILD_MS", "0")),
+                  "binary_size": os.environ.get("ZYRA_SIZE", ""),
+                  "binary_bytes": int(os.environ.get("ZYRA_BYTES", "0")),
+              },
+          }
+
+          with open("benchmarks/zyra.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, indent=2)
+              f.write("\n")
+
+          print(json.dumps(data, indent=2))
+          PYEOF
+
+      - name: Upload Zyra benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-zyra
+          path: benchmarks/zyra.json
+
+  benchmark-hical:
+    runs-on: ubuntu-24.04
+    name: Benchmark Hical
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install benchmark dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            gcc-14 \
+            g++-14 \
+            libboost-all-dev \
+            libssl-dev \
+            zlib1g-dev \
+            wrk \
+            curl
 
       - name: Configure Hical benchmark
         env:
@@ -140,20 +188,10 @@ jobs:
           echo "HICAL_LAT=$HICAL_LAT" >> "$GITHUB_ENV"
           echo "HICAL_RAM_MB=$HICAL_RAM_MB" >> "$GITHUB_ENV"
 
-      - name: Post comparison summary
-        run: |
-          cat >> "$GITHUB_STEP_SUMMARY" << 'HEREDOC'
-          ## 📊 Zyra vs Hical — Benchmark
+          kill "$HICAL_PID" 2>/dev/null || true
+          trap - EXIT
 
-          | Request metric | **Zyra** | **Hical** |
-          |----------------|----------|-----------|
-          HEREDOC
-          echo "| **Requests/sec** (wrk, 2t/100c/10s) | **${ZYRA_RPS}** | **${HICAL_RPS}** |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Avg latency** | **${ZYRA_LAT}** | **${HICAL_LAT}** |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "> Measured on GitHub Actions \`ubuntu-24.04\`. Load test: \`wrk -t2 -c100 -d10s\` against \`GET /\`. Runtime-adjacent metrics such as binary size, build time, and RSS are intentionally excluded from the comparison table." >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Save benchmark JSON
+      - name: Save Hical benchmark JSON
         run: |
           mkdir -p benchmarks
           python3 << 'PYEOF'
@@ -163,15 +201,6 @@ jobs:
               "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
               "runner": "ubuntu-24.04",
               "tool": "wrk -t2 -c100 -d10s",
-              "zyra": {
-                  "url": "http://127.0.0.1:3000/",
-                  "requests_per_sec": float(os.environ.get("ZYRA_RPS", "0")),
-                  "avg_latency": os.environ.get("ZYRA_LAT", ""),
-                  "ram_mb": float(os.environ.get("ZYRA_RAM_MB", "0")),
-                  "build_time_ms": int(os.environ.get("ZYRA_BUILD_MS", "0")),
-                  "binary_size": os.environ.get("ZYRA_SIZE", ""),
-                  "binary_bytes": int(os.environ.get("ZYRA_BYTES", "0")),
-              },
               "hical": {
                   "url": "http://127.0.0.1:3001/",
                   "requests_per_sec": float(os.environ.get("HICAL_RPS", "0")),
@@ -183,11 +212,80 @@ jobs:
               },
           }
 
+          with open("benchmarks/hical.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, indent=2)
+              f.write("\n")
+
+          print(json.dumps(data, indent=2))
+          PYEOF
+
+      - name: Upload Hical benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-hical
+          path: benchmarks/hical.json
+
+  summarize:
+    runs-on: ubuntu-24.04
+    name: Summarize benchmark results
+    needs:
+      - benchmark-zyra
+      - benchmark-hical
+
+    steps:
+      - name: Download benchmark artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-*
+          path: benchmarks
+          merge-multiple: true
+
+      - name: Merge benchmark JSON
+        run: |
+          python3 << 'PYEOF'
+          import json, time
+          from pathlib import Path
+
+          with open("benchmarks/zyra.json", "r", encoding="utf-8") as f:
+              zyra_data = json.load(f)
+          with open("benchmarks/hical.json", "r", encoding="utf-8") as f:
+              hical_data = json.load(f)
+
+          data = {
+              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "runner": "ubuntu-24.04",
+              "tool": "wrk -t2 -c100 -d10s",
+              "zyra": zyra_data["zyra"],
+              "hical": hical_data["hical"],
+          }
+
+          Path("benchmarks").mkdir(exist_ok=True)
           with open("benchmarks/latest.json", "w", encoding="utf-8") as f:
               json.dump(data, f, indent=2)
               f.write("\n")
 
           print(json.dumps(data, indent=2))
+          PYEOF
+
+      - name: Post comparison summary
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+
+          with open("benchmarks/latest.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          zyra = data["zyra"]
+          hical = data["hical"]
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("## 📊 Zyra vs Hical — Benchmark\n\n")
+              f.write("| Request metric | **Zyra** | **Hical** |\n")
+              f.write("|----------------|----------|-----------|\n")
+              f.write(f"| **Requests/sec** (wrk, 2t/100c/10s) | **{zyra['requests_per_sec']}** | **{hical['requests_per_sec']}** |\n")
+              f.write(f"| **Avg latency** | **{zyra['avg_latency']}** | **{hical['avg_latency']}** |\n\n")
+              f.write("> Measured on GitHub Actions `ubuntu-24.04`. Load test: `wrk -t2 -c100 -d10s` against `GET /`. Runtime-adjacent metrics such as binary size, build time, and RSS are intentionally excluded from the comparison table.\n")
           PYEOF
 
       - name: Upload benchmark artifact
