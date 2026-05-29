@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
-const httpx = @import("httpx");
 const Io = std.Io;
 
 const http = @import("http.zig");
@@ -326,35 +325,6 @@ pub const HttpServer = struct {
         _ = self.active_connections.fetchSub(1, .acq_rel);
     }
 
-    fn receiveRequestHead(self: *HttpServer, reader: *std.Io.Reader) !httpx.Parser {
-        var head = std.ArrayList(u8).empty;
-        errdefer head.deinit(self.allocator);
-
-        var byte: [1]u8 = undefined;
-        while (head.items.len < self.options.max_request_header_size) {
-            const n = try reader.readSliceShort(&byte);
-            if (n == 0) return error.HttpConnectionClosing;
-            try head.appendSlice(self.allocator, byte[0..n]);
-            if (head.items.len >= 4 and std.mem.eql(u8, head.items[head.items.len - 4 ..], "\r\n\r\n")) {
-                var parser = httpx.Parser.init(self.allocator);
-                errdefer parser.deinit();
-                _ = try parser.feed(head.items);
-                head.deinit(self.allocator);
-                return parser;
-            }
-        }
-        return error.HeaderTooLarge;
-    }
-
-    fn requestKeepAlive(self: *const HttpServer, parser: *const httpx.Parser) bool {
-        _ = self;
-        if (parser.headers.get("connection")) |connection| {
-            if (std.ascii.eqlIgnoreCase(connection, "close")) return false;
-            if (std.ascii.eqlIgnoreCase(connection, "keep-alive")) return true;
-        }
-        return parser.version == .HTTP_1_1;
-    }
-
     /// 解析 zio 执行器配置。Windows 被强制为单执行器；其他平台上
     /// `io_threads == 0` 交给 zio 的 CPU 自动检测（`.auto`），任何其他值
     /// 原样使用（钳制到运行时支持的范围内）。
@@ -407,8 +377,10 @@ pub const HttpServer = struct {
         };
         var writer = zio.net.Stream.Writer.fromStd(stream, io, write_buffer);
 
+        var raw_server = std.http.Server.init(&reader.interface, &writer.interface);
+
         // 空闲超时（若配置）仅限制 keep-alive 请求之间对下一个请求头的
-        // 等待。它在读取下一段请求头前装载，并在请求头到达后清除，因此不
+        // 等待。它在 `receiveHead` 前装载，并在请求头到达后清除，因此不
         // 影响进行中的请求体读取。zio 把它实现为事件循环内 recv + 定时器
         // 完成的竞争（无额外协程），这是在 epoll/io_uring 就绪模型下唯一
         // 真正会触发的超时机制。
@@ -416,29 +388,30 @@ pub const HttpServer = struct {
 
         while (true) {
             reader.setTimeout(idle_timeout);
-            var parser = self.receiveRequestHead(&reader.interface) catch |err| switch (err) {
+            var raw_request = raw_server.receiveHead() catch |err| switch (err) {
                 error.ReadFailed => return cancelOrClose(reader.err),
                 error.HttpConnectionClosing => return,
                 else => return,
             };
-            defer parser.deinit();
             reader.setTimeout(.none);
-            const keep_alive = self.requestKeepAlive(&parser);
+            const keep_alive = raw_request.head.keep_alive;
+
+            // WebSocket 升级：若客户端请求升级，且本路径注册了处理函数，
+            // 则接管该连接。
+            if (raw_request.upgradeRequested() == .websocket) {
+                const ws_path = http.stripQuery(raw_request.head.target);
+                if (self.router_.wsHandler(ws_path)) |handler| {
+                    try self.serveWebSocket(&raw_request, handler);
+                    return;
+                }
+            }
 
             var arena = self.memory_pool.requestArena();
             defer arena.deinit();
 
-            var request = http.HttpRequest.initHttpx(arena.allocator(), &parser, keep_alive) catch return;
+            var request = http.HttpRequest.initRaw(arena.allocator(), &raw_request) catch return;
             defer request.deinit();
             request.io = io;
-
-            // WebSocket 升级：若客户端请求升级，且本路径注册了处理函数，则接管该连接。
-            if (isWebSocketUpgrade(&request)) {
-                if (self.router_.wsHandler(request.path)) |handler| {
-                    try self.serveWebSocket(&request, &reader.interface, &writer.interface, handler);
-                    return;
-                }
-            }
 
             // 提供缓存的 OpenAPI 文档（若已启用）。
             if (self.openapi_json) |json| {
@@ -449,11 +422,7 @@ pub const HttpServer = struct {
                         .content_type = "application/json; charset=utf-8",
                         .keep_alive = keep_alive,
                     };
-                    response.respondWithIo(arena.allocator(), &writer.interface, io, request.method) catch |err| switch (err) {
-                        error.WriteFailed => return cancelOrClose(writer.err),
-                        else => return,
-                    };
-                    writer.interface.flush() catch |err| switch (err) {
+                    response.respond(&raw_request) catch |err| switch (err) {
                         error.WriteFailed => return cancelOrClose(writer.err),
                         else => return,
                     };
@@ -465,11 +434,7 @@ pub const HttpServer = struct {
             if (request.content_length) |content_length| {
                 if (content_length > self.options.max_request_body_size) {
                     var response = http.HttpResponse{ .status = .payload_too_large, .body = "Payload Too Large", .keep_alive = false };
-                    response.respondWithIo(arena.allocator(), &writer.interface, io, request.method) catch |err| switch (err) {
-                        error.WriteFailed => return cancelOrClose(writer.err),
-                        else => return,
-                    };
-                    writer.interface.flush() catch |err| switch (err) {
+                    response.respond(&raw_request) catch |err| switch (err) {
                         error.WriteFailed => return cancelOrClose(writer.err),
                         else => return,
                     };
@@ -477,35 +442,23 @@ pub const HttpServer = struct {
                 }
 
                 if (content_length > 0) {
-                    if (request.header("expect")) |expect| {
-                        if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
-                            writer.interface.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch |err| switch (err) {
-                                error.WriteFailed => return cancelOrClose(writer.err),
-                                else => return,
-                            };
-                            writer.interface.flush() catch |err| switch (err) {
-                                error.WriteFailed => return cancelOrClose(writer.err),
-                                else => return,
-                            };
-                        }
-                    }
+                    raw_request.writeExpectContinue() catch |err| switch (err) {
+                        error.WriteFailed => return cancelOrClose(writer.err),
+                        else => return,
+                    };
 
-                    const body = arena.allocator().alloc(u8, @intCast(content_length)) catch return;
-                    reader.interface.readSliceAll(body) catch |err| switch (err) {
+                    var body_buffer: [4096]u8 = undefined;
+                    const body_reader = raw_request.readerExpectNone(&body_buffer);
+                    request.body_bytes = body_reader.readAlloc(arena.allocator(), @intCast(content_length)) catch |err| switch (err) {
                         error.ReadFailed => return cancelOrClose(reader.err),
                         else => return,
                     };
-                    request.body_bytes = body;
                 }
             }
 
             var response = self.middleware_.execute(&self.router_, &request) catch |err| self.handleError(&request, err);
             response.keep_alive = keep_alive;
-            response.respondWithIo(arena.allocator(), &writer.interface, io, request.method) catch |err| switch (err) {
-                error.WriteFailed => return cancelOrClose(writer.err),
-                else => return,
-            };
-            writer.interface.flush() catch |err| switch (err) {
+            response.respondWithIo(&raw_request, io) catch |err| switch (err) {
                 error.WriteFailed => return cancelOrClose(writer.err),
                 else => return,
             };
@@ -524,35 +477,26 @@ pub const HttpServer = struct {
     /// 完成 WebSocket 握手并运行已注册的处理函数。
     fn serveWebSocket(
         self: *HttpServer,
-        request: *http.HttpRequest,
-        reader: *std.Io.Reader,
-        writer: *std.Io.Writer,
+        raw_request: *std.http.Server.Request,
         handler: @import("router.zig").WsHandler,
     ) Io.Cancelable!void {
         _ = self;
-        const key = request.header("sec-websocket-key") orelse return;
-        var accept_buf: [28]u8 = undefined;
-        const accept = websocket.computeAcceptKey(key, &accept_buf);
-        writer.writeAll("HTTP/1.1 101 Switching Protocols\r\n") catch return;
-        writer.writeAll("upgrade: websocket\r\n") catch return;
-        writer.writeAll("connection: Upgrade\r\n") catch return;
-        writer.print("sec-websocket-accept: {s}\r\n\r\n", .{accept}) catch return;
-        writer.flush() catch return;
+        const upgrade = raw_request.upgradeRequested();
+        const key = switch (upgrade) {
+            .websocket => |maybe_key| maybe_key orelse return,
+            else => return,
+        };
 
-        var session = websocket.WebSocketSession{ .reader = reader, .writer = writer };
+        var socket = raw_request.respondWebSocket(.{ .key = key }) catch return;
+        socket.flush() catch return;
+
+        var session = websocket.WebSocketSession{ .ws = &socket };
         handler(&session) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             else => {},
         };
     }
 };
-
-fn isWebSocketUpgrade(req: *const http.HttpRequest) bool {
-    const upgrade = req.header("upgrade") orelse return false;
-    if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return false;
-    const connection = req.header("connection") orelse return false;
-    return std.ascii.indexOfIgnoreCase(connection, "upgrade") != null;
-}
 
 fn cancelOrClose(err: ?anyerror) Io.Cancelable!void {
     if (err) |e| {
@@ -961,19 +905,11 @@ fn fileBodyServerMain(state: *FileBodyTestState) anyerror!void {
     var reader = zio.net.Stream.Reader.fromStd(stream, io, &rbuf);
     var wbuf: [4096]u8 = undefined;
     var writer = zio.net.Stream.Writer.fromStd(stream, io, &wbuf);
+    var raw_server = std.http.Server.init(&reader.interface, &writer.interface);
 
-    var discard: [1024]u8 = undefined;
-    var used: usize = 0;
-    while (used < discard.len) {
-        const n = try reader.interface.readSliceShort(discard[used .. used + 1]);
-        if (n == 0) return error.HttpConnectionClosing;
-        used += n;
-        if (used >= 4 and std.mem.eql(u8, discard[used - 4 .. used], "\r\n\r\n")) break;
-    }
-
+    var raw_request = try raw_server.receiveHead();
     const res = http.HttpResponse.fileBody(.ok, "text/plain", state.file_path, 0, state.file_len);
-    try res.respondWithIo(std.testing.allocator, &writer.interface, io, .get);
-    try writer.interface.flush();
+    try res.respondWithIo(&raw_request, io);
 }
 
 fn fileBodyClientMain(state: *FileBodyTestState) anyerror!void {
