@@ -12,6 +12,7 @@ pub const HttpRequest = http.HttpRequest;
 pub const HttpResponse = http.HttpResponse;
 
 pub const Router = @import("core/router.zig").Router;
+pub const RouteGroup = @import("core/router.zig").RouteGroup;
 pub const MiddlewarePipeline = @import("core/middleware.zig").MiddlewarePipeline;
 pub const HttpServer = @import("core/server.zig").HttpServer;
 pub const MemoryPool = @import("core/memory_pool.zig").MemoryPool;
