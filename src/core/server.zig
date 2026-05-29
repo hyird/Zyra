@@ -322,6 +322,8 @@ pub const HttpServer = struct {
     }
 
     const max_executors = 64;
+    const inline_read_buffer_size = 64 * 1024;
+    const inline_write_buffer_size = 4096;
 
     /// 把配置的 `idle_timeout_ms` 映射为 zio 读超时：0 表示无超时（无限
     /// 等待），其他值为毫秒时长。
@@ -334,12 +336,31 @@ pub const HttpServer = struct {
         defer self.releaseConnection();
         defer stream.close(io);
 
-        const read_buffer = self.allocator.alloc(u8, self.options.max_request_header_size) catch return;
-        defer self.allocator.free(read_buffer);
+        // 默认配置下把连接级读/写缓冲放在当前处理函数的栈帧里，避免每个
+        // 连接都向全局 allocator 申请两块短生命周期内存。用户把缓冲大小调
+        // 到内联容量以上时，再回退到堆分配以保留可配置性。
+        var inline_read_buffer: [inline_read_buffer_size]u8 = undefined;
+        var heap_read_buffer: ?[]u8 = null;
+        defer if (heap_read_buffer) |buffer| self.allocator.free(buffer);
+        const read_buffer = if (self.options.max_request_header_size <= inline_read_buffer.len)
+            inline_read_buffer[0..self.options.max_request_header_size]
+        else blk: {
+            const buffer = self.allocator.alloc(u8, self.options.max_request_header_size) catch return;
+            heap_read_buffer = buffer;
+            break :blk buffer;
+        };
         var reader = zio.net.Stream.Reader.fromStd(stream, io, read_buffer);
 
-        const write_buffer = self.allocator.alloc(u8, self.options.write_buffer_size) catch return;
-        defer self.allocator.free(write_buffer);
+        var inline_write_buffer: [inline_write_buffer_size]u8 = undefined;
+        var heap_write_buffer: ?[]u8 = null;
+        defer if (heap_write_buffer) |buffer| self.allocator.free(buffer);
+        const write_buffer = if (self.options.write_buffer_size <= inline_write_buffer.len)
+            inline_write_buffer[0..self.options.write_buffer_size]
+        else blk: {
+            const buffer = self.allocator.alloc(u8, self.options.write_buffer_size) catch return;
+            heap_write_buffer = buffer;
+            break :blk buffer;
+        };
         var writer = zio.net.Stream.Writer.fromStd(stream, io, write_buffer);
 
         var raw_server = std.http.Server.init(&reader.interface, &writer.interface);
