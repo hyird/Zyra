@@ -66,6 +66,11 @@ const RouteEntry = struct {
 
 pub const Router = struct {
     allocator: std.mem.Allocator,
+    /// 根路径 `/` 是最常见的基准与健康检查路径。为每个方法保留一个直接
+    /// 端点缓存，让热路径在 dispatch 时绕过 StringHashMap 的哈希与探测。
+    /// 路由仍然同时存入 `static_routes`，因此 routeCount/forEachRoute/OpenAPI
+    /// 等内省行为保持不变。
+    root_routes: [method_count]?RouteEndpoint = .{null} ** method_count,
     static_routes: [method_count]std.StringHashMapUnmanaged(RouteEndpoint) = .{std.StringHashMapUnmanaged(RouteEndpoint).empty} ** method_count,
     param_routes: [method_count]std.ArrayListUnmanaged(RouteEntry) = .{std.ArrayListUnmanaged(RouteEntry).empty} ** method_count,
     path_methods: std.StringHashMapUnmanaged(u16) = .{},
@@ -101,6 +106,7 @@ pub const Router = struct {
         if (isParamPath(path)) {
             try self.param_routes[index].append(self.allocator, .{ .path = path, .endpoint = endpoint });
         } else {
+            if (isRootPath(path)) self.root_routes[index] = endpoint;
             try self.static_routes[index].put(self.allocator, path, endpoint);
         }
 
@@ -188,6 +194,10 @@ pub const Router = struct {
 
     pub fn dispatch(self: *const Router, req: *http.HttpRequest) !http.HttpResponse {
         const index = methodIndex(req.method);
+
+        if (isRootPath(req.path)) {
+            if (self.root_routes[index]) |endpoint| return endpoint.invoke(req);
+        }
 
         if (self.static_routes[index].get(req.path)) |endpoint| {
             return endpoint.invoke(req);
@@ -333,6 +343,10 @@ fn methodIndex(method: http.HttpMethod) usize {
 
 fn methodBit(method: http.HttpMethod) u16 {
     return @as(u16, 1) << @intCast(methodIndex(method));
+}
+
+fn isRootPath(path: []const u8) bool {
+    return path.len == 1 and path[0] == '/';
 }
 
 fn isParamPath(path: []const u8) bool {

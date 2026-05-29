@@ -578,6 +578,16 @@ pub const HttpResponse = struct {
     }
 
     pub fn respond(self: HttpResponse, raw: *std.http.Server.Request) !void {
+        if (self.hasSimpleHeaders()) {
+            var headers: [1]Header = .{.{ .name = "content-type", .value = self.content_type }};
+            try raw.respond(self.body, .{
+                .status = self.status.toStd(),
+                .keep_alive = self.keep_alive,
+                .extra_headers = &headers,
+            });
+            return;
+        }
+
         var headers_buf: [24]Header = undefined;
         var cookie_values: [max_inline_cookies][256]u8 = undefined;
         const headers = self.buildHeaders(&headers_buf, &cookie_values);
@@ -654,6 +664,13 @@ pub const HttpResponse = struct {
             count += 1;
         }
         return headers_buf[0..count];
+    }
+
+    fn hasSimpleHeaders(self: *const HttpResponse) bool {
+        return self.inline_header_count == 0 and
+            self.extra_headers.len == 0 and
+            self.inline_cookie_count == 0 and
+            self.content_range_len == 0;
     }
 };
 
