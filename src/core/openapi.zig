@@ -8,11 +8,18 @@
 const std = @import("std");
 const http = @import("http.zig");
 const Router = @import("router.zig").Router;
+const schema = @import("schema.zig");
 
 pub const Operation = struct {
     method: http.HttpMethod,
     path: []const u8,
     summary: []const u8 = "",
+    /// Pre-rendered JSON Schema for the request body (owned by the document),
+    /// or null when the operation takes no JSON body.
+    request_schema: ?[]const u8 = null,
+    /// Pre-rendered JSON Schema for the 200 response body (owned by the
+    /// document), or null when the response has no documented schema.
+    response_schema: ?[]const u8 = null,
 };
 
 pub const Server = struct {
@@ -37,12 +44,56 @@ pub const OpenApiDocument = struct {
     }
 
     pub fn deinit(self: *OpenApiDocument) void {
+        for (self.operations.items) |op| {
+            if (op.request_schema) |s| self.allocator.free(s);
+            if (op.response_schema) |s| self.allocator.free(s);
+        }
         self.operations.deinit(self.allocator);
     }
 
     /// Registers an operation. `summary` may be empty.
     pub fn addOperation(self: *OpenApiDocument, method: http.HttpMethod, path: []const u8, summary: []const u8) !void {
         try self.operations.append(self.allocator, .{ .method = method, .path = path, .summary = summary });
+    }
+
+    /// Options for `addJsonOperation`. `Request`/`Response` are Zig types whose
+    /// JSON Schema is reflected at compile time; leave them as the default
+    /// `null` (i.e. omit) when the operation has no JSON request/response body.
+    pub const JsonOperationOptions = struct {
+        summary: []const u8 = "",
+    };
+
+    /// Registers an operation whose request and/or response bodies are described
+    /// by reflecting the given Zig types into inline JSON Schemas. Pass the
+    /// types via the `Request`/`Response` comptime parameters; use `void` to
+    /// indicate "no body". The rendered schemas are owned by the document.
+    pub fn addJsonOperation(
+        self: *OpenApiDocument,
+        comptime Request: type,
+        comptime Response: type,
+        method: http.HttpMethod,
+        path: []const u8,
+        options: JsonOperationOptions,
+    ) !void {
+        const request_schema: ?[]const u8 = if (Request == void)
+            null
+        else
+            try renderSchema(self.allocator, Request);
+        errdefer if (request_schema) |s| self.allocator.free(s);
+
+        const response_schema: ?[]const u8 = if (Response == void)
+            null
+        else
+            try renderSchema(self.allocator, Response);
+        errdefer if (response_schema) |s| self.allocator.free(s);
+
+        try self.operations.append(self.allocator, .{
+            .method = method,
+            .path = path,
+            .summary = options.summary,
+            .request_schema = request_schema,
+            .response_schema = response_schema,
+        });
     }
 
     /// Collects every HTTP route registered on `router` as an operation
@@ -166,12 +217,39 @@ pub const OpenApiDocument = struct {
             try w.endArray();
         }
 
+        // Request body schema, when the operation documents one.
+        if (op.request_schema) |req_schema| {
+            try w.objectField("requestBody");
+            try w.beginObject();
+            try w.objectField("required");
+            try w.write(true);
+            try w.objectField("content");
+            try w.beginObject();
+            try w.objectField("application/json");
+            try w.beginObject();
+            try w.objectField("schema");
+            try writeRawJson(w, req_schema);
+            try w.endObject();
+            try w.endObject();
+            try w.endObject();
+        }
+
         try w.objectField("responses");
         try w.beginObject();
         try w.objectField("200");
         try w.beginObject();
         try w.objectField("description");
         try w.write("Successful response");
+        if (op.response_schema) |resp_schema| {
+            try w.objectField("content");
+            try w.beginObject();
+            try w.objectField("application/json");
+            try w.beginObject();
+            try w.objectField("schema");
+            try writeRawJson(w, resp_schema);
+            try w.endObject();
+            try w.endObject();
+        }
         try w.endObject();
         try w.endObject();
 
@@ -179,13 +257,28 @@ pub const OpenApiDocument = struct {
     }
 };
 
+fn renderSchema(allocator: std.mem.Allocator, comptime T: type) ![]const u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+    var w = std.json.Stringify{ .writer = &out.writer };
+    try schema.writeSchema(&w, T);
+    return out.toOwnedSlice();
+}
+
+/// Emits a pre-rendered JSON value (e.g. a reflected schema) as a raw value at
+/// the current position in the stringifier.
+fn writeRawJson(w: *std.json.Stringify, raw: []const u8) !void {
+    try w.beginWriteRaw();
+    try w.writer.writeAll(raw);
+    w.endWriteRaw();
+}
+
 fn containsPath(paths: []const []const u8, path: []const u8) bool {
     for (paths) |p| {
         if (std.mem.eql(u8, p, path)) return true;
     }
     return false;
 }
-
 fn methodToLower(method: http.HttpMethod) ?[]const u8 {
     return switch (method) {
         .get => "get",
@@ -312,4 +405,61 @@ test "collectFromRouter gathers registered routes" {
     const by_id = paths.get("/users/{id}").?.object.get("get").?.object;
     const params = by_id.get("parameters").?.array;
     try std.testing.expectEqualStrings("id", params.items[0].object.get("name").?.string);
+}
+
+test "addJsonOperation reflects request and response schemas" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const CreateUser = struct {
+        name: []const u8,
+        age: ?u32,
+    };
+    const User = struct {
+        id: u64,
+        name: []const u8,
+    };
+
+    var doc = OpenApiDocument.init(a, .{ .title = "Schema API" });
+    defer doc.deinit();
+    try doc.addJsonOperation(CreateUser, User, .post, "/users", .{ .summary = "Create user" });
+    // Response-only operation (no request body).
+    try doc.addJsonOperation(void, User, .get, "/users/{id}", .{});
+
+    const json = try doc.generate();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+
+    const paths = parsed.value.object.get("paths").?.object;
+
+    // POST /users: requestBody schema reflected from CreateUser.
+    const post = paths.get("/users").?.object.get("post").?.object;
+    try std.testing.expectEqualStrings("Create user", post.get("summary").?.string);
+    const req_schema = post.get("requestBody").?.object
+        .get("content").?.object
+        .get("application/json").?.object
+        .get("schema").?.object;
+    try std.testing.expectEqualStrings("object", req_schema.get("type").?.string);
+    const req_props = req_schema.get("properties").?.object;
+    try std.testing.expectEqualStrings("string", req_props.get("name").?.object.get("type").?.string);
+    try std.testing.expect(req_props.get("age").?.object.get("nullable").?.bool);
+    // Only `name` is required (age is optional).
+    const req_required = req_schema.get("required").?.array;
+    try std.testing.expectEqual(@as(usize, 1), req_required.items.len);
+    try std.testing.expectEqualStrings("name", req_required.items[0].string);
+
+    // POST /users: 200 response schema reflected from User.
+    const post_resp = post.get("responses").?.object.get("200").?.object;
+    const resp_schema = post_resp.get("content").?.object
+        .get("application/json").?.object
+        .get("schema").?.object;
+    const resp_props = resp_schema.get("properties").?.object;
+    try std.testing.expectEqualStrings("integer", resp_props.get("id").?.object.get("type").?.string);
+
+    // GET /users/{id}: no requestBody, but a response schema.
+    const get = paths.get("/users/{id}").?.object.get("get").?.object;
+    try std.testing.expect(get.get("requestBody") == null);
+    try std.testing.expect(get.get("responses").?.object
+        .get("200").?.object.get("content") != null);
 }

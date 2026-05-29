@@ -30,6 +30,7 @@ pub const static_files = @import("core/static_files.zig");
 pub const StaticFiles = @import("core/static_files.zig").StaticFiles;
 pub const openapi = @import("core/openapi.zig");
 pub const OpenApiDocument = @import("core/openapi.zig").OpenApiDocument;
+pub const schema = @import("core/schema.zig");
 pub const websocket = @import("core/websocket.zig");
 pub const cors = @import("core/cors.zig");
 pub const Cors = @import("core/cors.zig").Cors;
@@ -54,6 +55,7 @@ test {
     _ = multipart;
     _ = static_files;
     _ = openapi;
+    _ = schema;
     _ = websocket;
     _ = cors;
     _ = session;

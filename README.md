@@ -40,7 +40,12 @@ Implemented web-facing Hical-style API surface includes:
 - OpenAPI: `OpenApiDocument` builds an OpenAPI 3.0.3 JSON document from
   registered operations (path params surfaced automatically). Call
   `server.enableOpenApi(.{ .title = ... })` after registering routes to
-  auto-collect every route and serve the document at `/openapi.json`
+  auto-collect every route and serve the document at `/openapi.json`.
+  `addJsonOperation(Request, Response, method, path, .{})` reflects Zig request
+  and response types into inline JSON Schemas at compile time (`void` means no
+  body). The reflector (`schema.writeSchema`) maps bool/int/float/string,
+  optionals (`nullable`), slices/arrays, enums (`string` + `enum`), and nested
+  structs (`object` + `properties`/`required`)
  - WebSocket: RFC 6455 frame codec (`websocket.Frame` encode/decode with
    masking) and handshake key derivation (`websocket.computeAcceptKey`).
    Register a handler with `server.ws(path, handler)`; the server performs the
