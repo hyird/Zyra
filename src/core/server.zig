@@ -11,10 +11,9 @@ const websocket = @import("websocket.zig");
 const openapi = @import("openapi.zig");
 const typed_route = @import("typed_route.zig");
 
-/// Records a typed route's OpenAPI metadata. `register` is a compile-time
-/// generated function that adds the route's reflected request/response schemas
-/// to a document; the `Request`/`Response` types are captured inside it, so no
-/// runtime type information needs to be stored.
+/// 记录一条类型化路由的 OpenAPI 元数据。`register` 是一个编译期生成的
+/// 函数，把该路由反射出的请求/响应 schema 加入文档；`Request`/`Response`
+/// 类型被捕获在它内部，因此无需存储任何运行时类型信息。
 const TypedRouteRecord = struct {
     method: http.HttpMethod,
     path: []const u8,
@@ -22,27 +21,25 @@ const TypedRouteRecord = struct {
     register: *const fn (*openapi.OpenApiDocument, http.HttpMethod, []const u8, []const u8) anyerror!void,
 };
 
-/// zio's `ExecutorCount` type, recovered from `Runtime.init`'s options
-/// parameter since the root `zio` module does not re-export it directly.
+/// zio 的 `ExecutorCount` 类型，从 `Runtime.init` 的选项参数中取回，因为
+/// 根 `zio` 模块并不直接重新导出它。
 const RuntimeOptions = @typeInfo(@TypeOf(zio.Runtime.init)).@"fn".params[1].type.?;
 const ExecutorCount = @FieldType(RuntimeOptions, "executors");
 
 pub const ServerOptions = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 3000,
-    /// Number of zio executors (I/O threads). 0 lets zio auto-detect based on
-    /// the CPU count. Windows is forced to a single executor to avoid
-    /// cross-IOCP socket I/O.
+    /// zio 执行器（I/O 线程）数量。0 让 zio 根据 CPU 数量自动检测。
+    /// Windows 被强制为单执行器，以避免跨 IOCP 的套接字 I/O。
     io_threads: usize = 0,
     max_request_header_size: usize = 64 * 1024,
     max_request_body_size: usize = 1024 * 1024,
     max_connections: usize = 10_000,
     write_buffer_size: usize = 4096,
-    /// Idle (keep-alive) timeout in milliseconds. While waiting for the next
-    /// request head on a kept-alive connection, the socket read is bounded by
-    /// this deadline; if no data arrives in time the connection is closed.
-    /// 0 disables the timeout (wait indefinitely). The timeout only applies to
-    /// the wait between requests, not to in-flight request processing.
+    /// 空闲（keep-alive）超时，单位毫秒。在 keep-alive 连接上等待下一个
+    /// 请求头时，套接字读取以此为期限；若到时仍无数据则关闭连接。
+    /// 0 禁用超时（无限等待）。该超时仅作用于请求之间的等待，不影响
+    /// 进行中的请求处理。
     idle_timeout_ms: u64 = 0,
 };
 
@@ -53,19 +50,17 @@ pub const HttpServer = struct {
     middleware_: MiddlewarePipeline,
     memory_pool: MemoryPool,
     active_connections: std.atomic.Value(usize),
-    /// Signaled by `requestShutdown` to begin a graceful shutdown: the accept
-    /// loop stops taking new connections and in-flight handlers are drained
-    /// before `start` returns. Threadsafe; safe to set from another thread.
+    /// 由 `requestShutdown` 触发以开始优雅关闭：accept 循环停止接收新连接，
+    /// 在 `start` 返回前排空进行中的处理函数。线程安全；可从其他线程设置。
     shutdown_event: std.Io.Event = .unset,
-    /// Set once the accept loop stops taking new connections, so handlers (and
-    /// tests) can observe that draining is underway.
+    /// 一旦 accept 循环停止接收新连接即被设置，使处理函数（和测试）能观察到
+    /// 正在进行排空。
     accepting: std.atomic.Value(bool) = .init(false),
-    /// Pre-generated OpenAPI JSON document, served at `openapi_path` when set.
+    /// 预生成的 OpenAPI JSON 文档，设置后在 `openapi_path` 提供。
     openapi_json: ?[]const u8 = null,
     openapi_path: []const u8 = "/openapi.json",
-    /// OpenAPI metadata for routes registered through the typed JSON helpers
-    /// (`getJson`/`postJson`/...). Used by `enableOpenApi` to emit reflected
-    /// request/response schemas.
+    /// 通过类型化 JSON 辅助函数（`getJson`/`postJson`/...）注册的路由的
+    /// OpenAPI 元数据。由 `enableOpenApi` 用于输出反射出的请求/响应 schema。
     typed_routes: std.ArrayListUnmanaged(TypedRouteRecord) = .empty,
     /// 可选的启动钩子：在 `start` 内部、zio 运行时已就绪且开始 accept
     /// *之前*被调用一次，并拿到运行时的 `std.Io`。用于初始化需要 io 的
@@ -103,8 +98,8 @@ pub const HttpServer = struct {
         try self.middleware_.useOnion(middleware);
     }
 
-    /// Registers a context-carrying onion middleware (e.g. CORS, sessions).
-    /// `context` must outlive the server.
+    /// 注册一个携带上下文的洋葱中间件（例如 CORS、会话）。`context` 必须
+    /// 比服务器存活更久。
     pub fn useOnionCtx(
         self: *HttpServer,
         context: *anyopaque,
@@ -121,24 +116,23 @@ pub const HttpServer = struct {
         try self.middleware_.useBeforeAfter(before, after);
     }
 
-    /// Registers a WebSocket handler for an exact path. The server upgrades
-    /// matching requests and runs the handler with a `WebSocketSession`.
+    /// 为精确路径注册一个 WebSocket 处理函数。服务器会升级匹配的请求，并
+    /// 以一个 `WebSocketSession` 运行该处理函数。
     pub fn ws(self: *HttpServer, path: []const u8, handler: @import("router.zig").WsHandler) !void {
         try self.router_.ws(path, handler);
     }
 
-    /// Options for the typed JSON route helpers.
+    /// 类型化 JSON 路由辅助函数的选项。
     pub const JsonRouteOptions = struct {
         summary: []const u8 = "",
     };
 
-    /// Registers a typed JSON route. `handler` is a function of the form
-    /// `fn(*HttpRequest, Body) E!Response` or `fn(*HttpRequest) E!Response`,
-    /// where `Body`/`Response` are Zig types. The framework parses the JSON body
-    /// into `Body` (responding 400 on malformed JSON), invokes the handler, and
-    /// serializes the returned value as a JSON response (`void` yields an empty
-    /// 200). The request/response types are reflected into OpenAPI schemas when
-    /// `enableOpenApi` is called.
+    /// 注册一条类型化 JSON 路由。`handler` 形如
+    /// `fn(*HttpRequest, Body) E!Response` 或 `fn(*HttpRequest) E!Response`，
+    /// 其中 `Body`/`Response` 是 Zig 类型。框架会把 JSON 请求体解析为 `Body`
+    /// （JSON 格式错误时返回 400），调用处理函数，并把返回值序列化为 JSON
+    /// 响应（`void` 产生空的 200）。当调用 `enableOpenApi` 时，请求/响应类型
+    /// 会被反射进 OpenAPI schema。
     pub fn routeJson(
         self: *HttpServer,
         method: http.HttpMethod,
@@ -186,15 +180,13 @@ pub const HttpServer = struct {
         try self.routeJson(.delete, path, handler, options);
     }
 
-    /// Generates an OpenAPI 3.0.3 document from all currently registered routes
-    /// and serves it at `/openapi.json`. Call this after registering routes.
-    /// Replaces any previously generated document.
+    /// 从当前所有已注册路由生成一份 OpenAPI 3.0.3 文档，并在 `/openapi.json`
+    /// 提供。请在注册完路由后调用。会替换任何先前生成的文档。
     pub fn enableOpenApi(self: *HttpServer, config: openapi.Config) !void {
         var doc = openapi.OpenApiDocument.init(self.allocator, config);
         defer doc.deinit();
-        // Typed JSON routes first so their reflected schemas are recorded;
-        // `collectFromRouter` then fills in any remaining plain routes without
-        // overwriting them.
+        // 先处理类型化 JSON 路由，以记录它们反射出的 schema；随后
+        // `collectFromRouter` 补齐其余普通路由，且不覆盖已记录的。
         for (self.typed_routes.items) |record| {
             try record.register(&doc, record.method, record.path, record.summary);
         }
@@ -236,8 +228,8 @@ pub const HttpServer = struct {
 
         std.log.info("Zyra listening on {f}", .{listener.socket.address});
 
-        // In-flight connection handlers live in this group. On shutdown we
-        // `await` (not `cancel`) the group so active requests finish draining.
+        // 进行中的连接处理函数存活在这个 group 中。关闭时我们对该 group
+        // 执行 `await`（而非 `cancel`），让活跃请求完成排空。
         var group: Io.Group = .init;
 
         // 在开始 accept 之前运行启动钩子，让用户初始化依赖 io 的资源。
@@ -245,15 +237,14 @@ pub const HttpServer = struct {
 
         self.accepting.store(true, .release);
 
-        // Run the accept loop concurrently so the calling fiber can wait for the
-        // shutdown signal. When that signal arrives we cancel the accept loop,
-        // which interrupts the blocked `accept` at its next cancelation point.
+        // 并发运行 accept 循环，使调用方 fiber 可以等待关闭信号。当该信号
+        // 到来时取消 accept 循环，从而在其下一个取消点中断阻塞的 `accept`。
     var accept_future = io.async(HttpServer.acceptLoop, .{ self, io, &listener, &group });
 
-        // Block until a graceful shutdown is requested (or never, if it isn't).
+        // 阻塞直到请求优雅关闭（若从不请求则一直阻塞）。
         self.shutdown_event.waitUncancelable(io);
 
-        // Stop accepting new connections, then drain handlers already running.
+        // 停止接收新连接，然后排空已在运行的处理函数。
         self.accepting.store(false, .release);
         _ = accept_future.cancel(io);
         group.await(io) catch {};
@@ -271,22 +262,19 @@ pub const HttpServer = struct {
         self.on_ready_fn = handler;
     }
 
-    /// Requests a graceful shutdown: stops accepting new connections and lets
-    /// in-flight requests finish before `start` returns. Threadsafe; may be
-    /// called from another fiber/thread (e.g. a signal handler bridge).
+    /// 请求优雅关闭：停止接收新连接，并在 `start` 返回前让进行中的请求
+    /// 完成。线程安全；可从其他 fiber/线程调用（例如信号处理桥接）。
     pub fn requestShutdown(self: *HttpServer, io: Io) void {
         self.shutdown_event.set(io);
     }
 
-    /// True while the server is still accepting new connections. Becomes false
-    /// once a graceful shutdown has begun.
+    /// 服务器仍在接收新连接时为 true。一旦优雅关闭开始即变为 false。
     pub fn isAccepting(self: *const HttpServer) bool {
         return self.accepting.load(.acquire);
     }
 
-    /// Accept loop, run as a cancelable task. Cancellation (triggered by
-    /// `requestShutdown`) surfaces as `error.Canceled` from `accept`, which ends
-    /// the loop without taking further connections.
+    /// accept 循环，作为可取消任务运行。取消（由 `requestShutdown` 触发）
+    /// 表现为 `accept` 返回 `error.Canceled`，从而结束循环且不再接收连接。
     fn acceptLoop(self: *HttpServer, io: Io, listener: *Io.net.Server, group: *Io.Group) void {
         while (true) {
             const stream = listener.accept(io) catch return;
@@ -323,10 +311,9 @@ pub const HttpServer = struct {
         _ = self.active_connections.fetchSub(1, .acq_rel);
     }
 
-    /// Resolves the zio executor configuration. Windows is forced to a single
-    /// executor; elsewhere `io_threads == 0` defers to zio's CPU auto-detection
-    /// (`.auto`) and any other value is used verbatim (clamped to the runtime's
-    /// supported range).
+    /// 解析 zio 执行器配置。Windows 被强制为单执行器；其他平台上
+    /// `io_threads == 0` 交给 zio 的 CPU 自动检测（`.auto`），任何其他值
+    /// 原样使用（钳制到运行时支持的范围内）。
     fn executorOption(self: *const HttpServer) ExecutorCount {
         if (builtin.os.tag == .windows) return .exact(1);
         if (self.options.io_threads == 0) return .auto;
@@ -336,8 +323,8 @@ pub const HttpServer = struct {
 
     const max_executors = 64;
 
-    /// Maps the configured `idle_timeout_ms` to a zio read timeout: 0 means no
-    /// timeout (wait indefinitely), any other value a millisecond duration.
+    /// 把配置的 `idle_timeout_ms` 映射为 zio 读超时：0 表示无超时（无限
+    /// 等待），其他值为毫秒时长。
     fn idleTimeout(self: *const HttpServer) zio.Timeout {
         if (self.options.idle_timeout_ms == 0) return .none;
         return .fromMilliseconds(self.options.idle_timeout_ms);
@@ -357,12 +344,11 @@ pub const HttpServer = struct {
 
         var raw_server = std.http.Server.init(&reader.interface, &writer.interface);
 
-        // Idle timeout (if configured) bounds only the wait for the next request
-        // head between keep-alive requests. It is armed before `receiveHead` and
-        // cleared once a head arrives so in-flight body reads are not affected.
-        // zio implements this as a recv + timer completion racing inside the
-        // event loop (no extra coroutine), which is the only timeout mechanism
-        // that actually fires under epoll/io_uring readiness models.
+        // 空闲超时（若配置）仅限制 keep-alive 请求之间对下一个请求头的
+        // 等待。它在 `receiveHead` 前装载，并在请求头到达后清除，因此不
+        // 影响进行中的请求体读取。zio 把它实现为事件循环内 recv + 定时器
+        // 完成的竞争（无额外协程），这是在 epoll/io_uring 就绪模型下唯一
+        // 真正会触发的超时机制。
         const idle_timeout = self.idleTimeout();
 
         while (true) {
@@ -375,8 +361,8 @@ pub const HttpServer = struct {
             reader.setTimeout(.none);
             const keep_alive = raw_request.head.keep_alive;
 
-            // WebSocket upgrade: if the client requests an upgrade and a handler
-            // is registered for this path, take over the connection.
+            // WebSocket 升级：若客户端请求升级，且本路径注册了处理函数，
+            // 则接管该连接。
             if (raw_request.upgradeRequested() == .websocket) {
                 const ws_path = http.stripQuery(raw_request.head.target);
                 if (self.router_.wsHandler(ws_path)) |handler| {
@@ -392,7 +378,7 @@ pub const HttpServer = struct {
             defer request.deinit();
             request.io = io;
 
-            // Serve the cached OpenAPI document, if enabled.
+            // 提供缓存的 OpenAPI 文档（若已启用）。
             if (self.openapi_json) |json| {
                 if (request.method == .get and std.mem.eql(u8, request.path, self.openapi_path)) {
                     var response = http.HttpResponse{
@@ -446,7 +432,7 @@ pub const HttpServer = struct {
         }
     }
 
-    /// Completes the WebSocket handshake and runs the registered handler.
+    /// 完成 WebSocket 握手并运行已注册的处理函数。
     fn serveWebSocket(
         self: *HttpServer,
         raw_request: *std.http.Server.Request,
@@ -487,7 +473,7 @@ test "HttpServer configuration API without sockets" {
     try expectEqual(@as(usize, 1024 * 1024), server.options.max_request_body_size);
     try expectEqual(@as(usize, 64 * 1024), server.options.max_request_header_size);
     try expectEqual(@as(usize, 10_000), server.options.max_connections);
-    // Idle timeout defaults to disabled (wait indefinitely).
+    // 空闲超时默认禁用（无限等待）。
     try expectEqual(@as(u64, 0), server.options.idle_timeout_ms);
 
     server.setMaxBodySize(2 * 1024 * 1024);
@@ -532,14 +518,14 @@ test "executorOption honors platform and io_threads" {
     defer huge_server.deinit();
 
     if (builtin.os.tag == .windows) {
-        // Windows is always forced to a single executor.
+        // Windows 始终被强制为单执行器。
         try std.testing.expectEqual(ExecutorCount.exact(1), auto_server.executorOption());
         try std.testing.expectEqual(ExecutorCount.exact(1), fixed_server.executorOption());
         try std.testing.expectEqual(ExecutorCount.exact(1), huge_server.executorOption());
     } else {
-        // 0 defers to zio's CPU auto-detection.
+        // 0 交给 zio 的 CPU 自动检测。
         try std.testing.expectEqual(ExecutorCount.auto, auto_server.executorOption());
-        // Explicit values are used verbatim, clamped to the supported range.
+        // 显式值原样使用，钳制到支持的范围内。
         try std.testing.expectEqual(ExecutorCount.exact(4), fixed_server.executorOption());
         try std.testing.expectEqual(ExecutorCount.exact(HttpServer.max_executors), huge_server.executorOption());
     }
@@ -599,7 +585,7 @@ test "enableOpenApi generates and caches a document" {
     try std.testing.expectEqualStrings("Smoke API", parsed.value.object.get("info").?.object.get("title").?.string);
     try std.testing.expect(parsed.value.object.get("paths").?.object.get("/users") != null);
 
-    // Re-enabling replaces the cached document without leaking.
+    // 重新启用会替换缓存文档且不泄漏。
     try server.enableOpenApi(.{ .title = "Replaced" });
     const parsed2 = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, server.openapi_json.?, .{});
     defer parsed2.deinit();
@@ -651,7 +637,7 @@ test "enableOpenApi reflects typed route request and response schemas" {
         .get("/greet").?.object
         .get("post").?.object;
 
-    // Request body schema reflects TypedTestBody.
+    // 请求体 schema 反射出 TypedTestBody。
     const req_props = op.get("requestBody").?.object
         .get("content").?.object
         .get("application/json").?.object
@@ -660,7 +646,7 @@ test "enableOpenApi reflects typed route request and response schemas" {
     try std.testing.expect(req_props.get("name") != null);
     try std.testing.expect(req_props.get("count") != null);
 
-    // Response schema reflects TypedTestReply.
+    // 响应 schema 反射出 TypedTestReply。
     const resp_props = op.get("responses").?.object
         .get("200").?.object
         .get("content").?.object
@@ -671,7 +657,7 @@ test "enableOpenApi reflects typed route request and response schemas" {
     try std.testing.expect(resp_props.get("count") != null);
 }
 
-// --- Graceful shutdown -------------------------------------------------------
+// --- 优雅关闭 -------------------------------------------------------
 
 const ShutdownTestState = struct {
     server: *HttpServer,
@@ -680,9 +666,9 @@ const ShutdownTestState = struct {
     served_status: ?http.HttpStatus = null,
 };
 
-/// Mirrors `HttpServer.start` but binds an ephemeral port and reports the bound
-/// address back through `state` so the test client can connect. Runs the accept
-/// loop concurrently, then waits for the shutdown signal and drains.
+/// 镜像 `HttpServer.start`，但绑定一个临时端口，并通过 `state` 把绑定地址
+/// 报告回去，以便测试客户端连接。并发运行 accept 循环，然后等待关闭信号
+/// 并排空。
 fn shutdownServerMain(state: *ShutdownTestState) anyerror!void {
     const self = state.server;
     const io = state.io;
@@ -691,7 +677,7 @@ fn shutdownServerMain(state: *ShutdownTestState) anyerror!void {
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
-    // Publish the actual bound port for the client (port 0 -> OS-assigned).
+    // 为客户端发布实际绑定的端口（端口 0 -> 由操作系统分配）。
     self.options.port = listener.socket.address.getPort();
 
     var group: Io.Group = .init;
@@ -709,12 +695,12 @@ fn shutdownClientMain(state: *ShutdownTestState) anyerror!void {
     const self = state.server;
     const io = state.io;
 
-    // Wait until the server is accepting and has a bound port.
+    // 等待服务器开始接收且已绑定端口。
     while (!self.isAccepting() or self.options.port == 0) {
         try io.sleep(.fromMilliseconds(1), .awake);
     }
 
-    // One real request over loopback, then graceful shutdown.
+    // 通过 loopback 发送一个真实请求，然后优雅关闭。
     const addr = try Io.net.IpAddress.parseIp4("127.0.0.1", self.options.port);
     var stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -726,14 +712,14 @@ fn shutdownClientMain(state: *ShutdownTestState) anyerror!void {
 
     var rbuf: [1024]u8 = undefined;
     var reader = stream.reader(io, &rbuf);
-    // Read the status line; tolerate short reads.
+    // 读取状态行；容忍短读。
     var line_buf: [64]u8 = undefined;
     const n = reader.interface.readSliceShort(&line_buf) catch 0;
     if (n > 0 and std.mem.indexOf(u8, line_buf[0..n], "200") != null) {
         state.served_status = .ok;
     }
 
-    // Request graceful shutdown; the server fiber drains and returns.
+    // 请求优雅关闭；服务器 fiber 排空后返回。
     self.requestShutdown(io);
 }
 
@@ -773,12 +759,12 @@ test "requestShutdown stops accepting and drains in-flight handlers" {
     var state = ShutdownTestState{ .server = &server, .io = runtime.io() };
     try shutdownTestRoot(&state);
 
-    // The request was served and the server is no longer accepting.
+    // 请求已被处理，且服务器不再接收新连接。
     try std.testing.expectEqual(http.HttpStatus.ok, state.served_status orelse return error.NoResponse);
     try std.testing.expect(!server.isAccepting());
 }
 
-// --- FileBody streaming end-to-end ---------------------------------------
+// --- FileBody 流式发送端到端 ---------------------------------------
 
 const FileBodyTestState = struct {
     io: Io,
@@ -791,8 +777,8 @@ const FileBodyTestState = struct {
     err: ?anyerror = null,
 };
 
-/// Accepts one loopback connection, receives the request head, and replies with
-/// a file-backed body via `respondWithIo`.
+/// 接受一个 loopback 连接，接收请求头，并通过 `respondWithIo` 以文件支撑
+/// 的响应体回复。
 fn fileBodyServerMain(state: *FileBodyTestState) anyerror!void {
     const io = state.io;
 
@@ -842,7 +828,7 @@ fn fileBodyClientMain(state: *FileBodyTestState) anyerror!void {
     }
     const response = acc[0..total];
     if (std.mem.indexOf(u8, response, "200") != null) state.status_ok = true;
-    // Body follows the blank line; the file content is "Hello, FileBody!".
+    // 响应体跟在空行之后；文件内容为 "Hello, FileBody!"。
     if (std.mem.indexOf(u8, response, "Hello, FileBody!") != null) state.body_ok = true;
 }
 
@@ -881,7 +867,7 @@ test "respondWithIo streams a file-backed body over loopback" {
     const payload = "Hello, FileBody!";
     const path = "zig-cache-zyra-filebody-smoke.txt";
 
-    // Create the temp file using the same std.Io backend respondWithIo reads.
+    // 用同一个 respondWithIo 读取所用的 std.Io 后端创建临时文件。
     {
         var dir = std.Io.Dir.cwd();
         var f = try dir.createFile(io, path, .{});
@@ -902,7 +888,7 @@ test "respondWithIo streams a file-backed body over loopback" {
     try std.testing.expect(state.body_ok);
 }
 
-// --- onReady startup hook -------------------------------------------------
+// --- onReady 启动钩子 -------------------------------------------------
 
 const OnReadyState = struct {
     called: bool = false,

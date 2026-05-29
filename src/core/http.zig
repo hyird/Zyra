@@ -109,8 +109,8 @@ pub const HttpRequest = struct {
     content_type: ?[]const u8 = null,
     content_length: ?u64 = null,
     keep_alive: bool = true,
-    /// Runtime I/O handle, set by the server. Available to handlers that need
-    /// file or socket I/O (e.g. static file serving). Null in unit tests.
+    /// 运行时 I/O 句柄，由服务器设置。提供给需要文件或套接字 I/O 的处理
+    /// 函数（例如静态文件服务）。单元测试中为 null。
     io: ?std.Io = null,
     inline_params: [max_inline_params]Param = undefined,
     inline_param_count: u8 = 0,
@@ -156,21 +156,67 @@ pub const HttpRequest = struct {
         };
     }
 
+    /// 从原始 `std.http.Server.Request` 构造一个请求。
+    ///
+    /// 零拷贝优化分两档，取决于请求是否带请求体：
+    ///
+    /// - **无 body 请求**（无 content-length 或为 0，且非 chunked 传输）：
+    ///   处理期间不会消费输入流，因此 reader 的 `head_buffer` 在整个请求
+    ///   生命周期（直到 `respond` 写出、请求 `deinit`）内保持有效。此时
+    ///   **完全不复制**，target/content_type/header 切片直接借用 reader
+    ///   缓冲——每请求 **零分配**。下一次 `receiveHead` 才会覆盖该缓冲，
+    ///   而那时请求早已 deinit。
+    /// - **有 body 请求**：请求体读取（`readAlloc`/`fillMore`）会 rebase 并
+    ///   覆盖 `head_buffer`，使借用的 header 切片悬垂。因此把整段
+    ///   `head_buffer` 一次性复制进请求 arena（单次分配），并把每个借用
+    ///   切片重定位到这份独立副本上。
+    ///
+    /// 两种情况都把 “每个 header 各做一次 dupe” 的 `2N+2` 次分配，降为
+    /// 0（无 body）或 1（有 body）次。
     pub fn initRaw(allocator: std.mem.Allocator, raw: *const std.http.Server.Request) !HttpRequest {
-        const target = try allocator.dupe(u8, raw.head.target);
+        const original = raw.head_buffer;
+
+        // 是否会在请求处理期间消费输入流（从而使 head_buffer 失效）。有两条
+        // 独立的消费路径，任一成立都必须复制 head_buffer：
+        //   1. 服务器读取请求体（`handleClient` 在 content_length>0 或 chunked
+        //      时调用 readAlloc）。
+        //   2. `std.http.Server` 在 `respond` 内调用 `discardBody` 丢弃未读
+        //      请求体——它只在 `method.requestHasBody()`（POST/PUT/PATCH）时
+        //      才消费输入流，哪怕 content_length 为 0。
+        // 因此判定 = 任意带体方法，或存在非空/分块请求体。其余（GET/HEAD/
+        // DELETE/OPTIONS 且无体）全程不碰输入流，可纯借用、零分配。
+        const has_body = methodHasBody(raw.head.method) or
+            raw.head.transfer_encoding == .chunked or
+            (raw.head.content_length orelse 0) > 0;
+
+        // 无 body：借用原缓冲，恒等重定位，零分配。
+        // 有 body：复制一份独立副本，切片重定位到副本。
+        const head: []const u8 = if (has_body) try allocator.dupe(u8, original) else original;
+
+        // 把一个借用自 `original` 的切片重定位到 `head` 的同一偏移上。
+        // 任何切片都满足 `original.ptr <= s.ptr <= original.ptr + original.len`，
+        // 因为它们都解析自 head_buffer。`head == original` 时这是恒等映射。
+        const Reloc = struct {
+            fn slice(orig: []const u8, dst: []const u8, s: []const u8) []const u8 {
+                const offset = @intFromPtr(s.ptr) - @intFromPtr(orig.ptr);
+                return dst[offset..][0..s.len];
+            }
+        };
+
+        const target = Reloc.slice(original, head, raw.head.target);
         var request = HttpRequest{
             .allocator = allocator,
             .method = .fromStd(raw.head.method),
             .path = stripQuery(target),
             .target = target,
-            .content_type = if (raw.head.content_type) |ct| try allocator.dupe(u8, ct) else null,
+            .content_type = if (raw.head.content_type) |ct| Reloc.slice(original, head, ct) else null,
             .content_length = raw.head.content_length,
             .keep_alive = raw.head.keep_alive,
         };
         var iter = raw.iterateHeaders();
         while (iter.next()) |entry| {
-            const name = try allocator.dupe(u8, entry.name);
-            const value = try allocator.dupe(u8, entry.value);
+            const name = Reloc.slice(original, head, entry.name);
+            const value = Reloc.slice(original, head, entry.value);
             try request.addHeader(name, value);
         }
         return request;
@@ -215,16 +261,16 @@ pub const HttpRequest = struct {
         return self.content_type orelse self.header("content-type");
     }
 
-    /// Parses the request body as JSON into a value of type `T`.
-    /// Allocations are made from the request allocator (per-request arena) and
-    /// are released when the request is freed, so no separate deinit is needed.
+    /// 把请求体解析为类型 `T` 的 JSON 值。
+    /// 分配使用请求分配器（每请求 arena），在请求释放时一并释放，因此
+    /// 无需单独 deinit。
     pub fn readJson(self: *HttpRequest, comptime T: type) !T {
         return std.json.parseFromSliceLeaky(T, self.allocator, self.body_bytes, .{
             .ignore_unknown_fields = true,
         });
     }
 
-    /// Builds a JSON response by serializing `value` using the request allocator.
+    /// 用请求分配器序列化 `value`，构建一个 JSON 响应。
     pub fn jsonResponse(self: *HttpRequest, value: anytype) !HttpResponse {
         return HttpResponse.jsonValue(self.allocator, value);
     }
@@ -352,17 +398,15 @@ pub const HttpRequest = struct {
         return null;
     }
 
-    /// Stores an opaque pointer attribute on the request. Unlike `setAttribute`
-    /// (which stores string values), this lets middleware attach references to
-    /// runtime objects (e.g. a session) for downstream handlers. The pointer is
-    /// not owned by the request; the caller manages its lifetime.
+    /// 在请求上存放一个不透明指针属性。与 `setAttribute`（存放字符串值）
+    /// 不同，它让中间件把对运行时对象的引用（例如会话）附加给下游处理
+    /// 函数。该指针不归请求所有；其生命周期由调用方管理。
     pub fn setAttributePtr(self: *HttpRequest, key: []const u8, value: *anyopaque) !void {
         if (self.ptr_attributes == null) self.ptr_attributes = .{};
         try self.ptr_attributes.?.put(self.allocator, key, value);
     }
 
-    /// Retrieves an opaque pointer attribute previously set with
-    /// `setAttributePtr`, or null if absent.
+    /// 取回先前用 `setAttributePtr` 设置的不透明指针属性，不存在则返回 null。
     pub fn getAttributePtr(self: *const HttpRequest, key: []const u8) ?*anyopaque {
         if (self.ptr_attributes) |attrs| return attrs.get(key);
         return null;
@@ -389,15 +433,13 @@ pub const HttpResponse = struct {
     inline_cookie_count: u8 = 0,
     content_range_buffer: [64]u8 = undefined,
     content_range_len: u8 = 0,
-    /// When set, the response body is streamed from a file on disk instead of
-    /// `body`. The file is opened and read in chunks at send time (see
-    /// `respondWithIo`), so large files do not need to be buffered in memory.
+    /// 设置后，响应体从磁盘文件流式发送，而非使用 `body`。文件在发送时
+    /// 打开并分块读取（见 `respondWithIo`），因此大文件无需在内存中缓冲。
     file: ?FileBody = null,
 
-    /// A file-backed response body. The framing layer opens `path` (relative to
-    /// the current working directory) at send time, seeks to `offset`, and
-    /// streams exactly `length` bytes. `path` must remain valid until the
-    /// response is sent (request-arena lifetime is sufficient).
+    /// 文件支撑的响应体。组帧层在发送时打开 `path`（相对于当前工作目录），
+    /// 定位到 `offset`，并精确流式发送 `length` 字节。`path` 必须保持有效
+    /// 直到响应发送完毕（请求 arena 生命周期即足够）。
     pub const FileBody = struct {
         path: []const u8,
         offset: u64 = 0,
@@ -416,8 +458,8 @@ pub const HttpResponse = struct {
         return .{ .body = body, .content_type = "application/json" };
     }
 
-    /// Serializes `value` to JSON using `allocator` and returns a response with
-    /// the JSON content type set. The serialized bytes are owned by `allocator`.
+    /// 用 `allocator` 把 `value` 序列化为 JSON，并返回设置了 JSON 内容类型
+    /// 的响应。序列化后的字节归 `allocator` 所有。
     pub fn jsonValue(allocator: std.mem.Allocator, value: anytype) !HttpResponse {
         const body = try stringifyJson(allocator, value);
         return .{ .body = body, .content_type = "application/json" };
@@ -443,9 +485,9 @@ pub const HttpResponse = struct {
         return .{ .status = .internal_server_error, .body = "Internal Server Error" };
     }
 
-    /// Builds a response whose body is streamed from `path` at send time,
-    /// covering `length` bytes starting at `offset`. Use `.partial_content` for
-    /// 206 range responses and `.ok` for full-file responses.
+    /// 构建一个响应，其响应体在发送时从 `path` 流式发送，覆盖从 `offset`
+    /// 起的 `length` 字节。206 范围响应用 `.partial_content`，整文件响应
+    /// 用 `.ok`。
     pub fn fileBody(status: HttpStatus, content_type: []const u8, path: []const u8, offset: u64, length: u64) HttpResponse {
         return .{
             .status = status,
@@ -467,8 +509,8 @@ pub const HttpResponse = struct {
         return response;
     }
 
-    /// Sets a satisfied `Content-Range: bytes start-end/total` header (used for
-    /// 206 Partial Content responses).
+    /// 设置一个满足请求的 `Content-Range: bytes start-end/total` 头部
+    /// （用于 206 Partial Content 响应）。
     pub fn setContentRange(self: *HttpResponse, start: u64, end: u64, total: u64) void {
         const value = std.fmt.bufPrint(&self.content_range_buffer, "bytes {d}-{d}/{d}", .{ start, end, total }) catch unreachable;
         self.content_range_len = @intCast(value.len);
@@ -517,8 +559,8 @@ pub const HttpResponse = struct {
         self.content_type = content_type_;
     }
 
-    /// Serializes `value` to JSON using `allocator`, stores it as the response
-    /// body, and sets the JSON content type. The bytes are owned by `allocator`.
+    /// 用 `allocator` 把 `value` 序列化为 JSON，存为响应体，并设置 JSON
+    /// 内容类型。字节归 `allocator` 所有。
     pub fn setJsonBody(self: *HttpResponse, allocator: std.mem.Allocator, value: anytype) !void {
         self.body = try stringifyJson(allocator, value);
         self.content_type = "application/json";
@@ -546,9 +588,8 @@ pub const HttpResponse = struct {
         });
     }
 
-    /// Like `respond`, but if `file` is set the body is streamed from disk in
-    /// chunks (constant memory) instead of being buffered. Requires `io`.
-    /// Falls back to `respond` when there is no file body.
+    /// 同 `respond`，但若设置了 `file`，则响应体以分块方式从磁盘流式发送
+    /// （常量内存）而非缓冲。需要 `io`。没有文件体时回退到 `respond`。
     pub fn respondWithIo(self: HttpResponse, raw: *std.http.Server.Request, io: std.Io) !void {
         const fb = self.file orelse return self.respond(raw);
 
@@ -560,7 +601,7 @@ pub const HttpResponse = struct {
         var file = dir.openFile(io, fb.path, .{}) catch return error.FileOpenFailed;
         defer file.close(io);
 
-        // Stream the body with an explicit content-length equal to the range.
+        // 以等于范围长度的显式 content-length 流式发送响应体。
         var send_buf: [64 * 1024]u8 = undefined;
         var body_writer = try raw.respondStreaming(&send_buf, .{
             .content_length = fb.length,
@@ -571,7 +612,7 @@ pub const HttpResponse = struct {
             },
         });
 
-        // HEAD requests elide the body; skip the file work entirely.
+        // HEAD 请求省略响应体；完全跳过文件读取工作。
         if (!body_writer.isEliding() and fb.length > 0) {
             var read_buf: [64 * 1024]u8 = undefined;
             var reader = file.reader(io, &read_buf);
@@ -582,8 +623,8 @@ pub const HttpResponse = struct {
         try body_writer.end();
     }
 
-    /// Assembles the response header list (content-type, inline/extra headers,
-    /// content-range, and set-cookie) into the caller-provided buffers.
+    /// 把响应头部列表（内容类型、内联/额外头部、content-range、set-cookie）
+    /// 组装进调用方提供的缓冲区中。
     fn buildHeaders(
         self: *const HttpResponse,
         headers_buf: *[24]Header,
@@ -706,6 +747,17 @@ fn percentDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     return decoded[0..out];
 }
 
+
+/// 该方法的请求按 HTTP 语义是否可能携带请求体。镜像 std 的
+/// `std.http.Method.requestHasBody`，用于决定 `initRaw` 是否必须复制
+/// head_buffer（因为 `std.http.Server.respond` 会对带体方法丢弃未读体，
+/// 从而消费输入流并使借用的 head 切片失效）。
+fn methodHasBody(m: std.http.Method) bool {
+    return switch (m) {
+        .POST, .PUT, .PATCH => true,
+        else => false,
+    };
+}
 
 pub fn stripQuery(target: []const u8) []const u8 {
     return target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];

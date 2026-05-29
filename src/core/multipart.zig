@@ -1,11 +1,9 @@
-//! multipart/form-data parser (RFC 7578).
+//! multipart/form-data 解析器（RFC 7578）。
 //!
-//! Parses a `multipart/form-data` request body into a list of `Part` values,
-//! each carrying its headers, form field name, optional upload filename,
-//! optional content type, and raw data. Convenience lookups for file and text
-//! fields are provided. All returned slices reference the supplied `body`
-//! buffer (zero-copy); only the `Part` array and the headers list are allocated
-//! from `allocator`.
+//! 把 `multipart/form-data` 请求体解析为一组 `Part`，每个 `Part` 带有它的
+//! 头部、表单字段名、可选的上传文件名、可选的内容类型，以及原始数据。
+//! 另提供按文件/文本字段查找的便捷函数。所有返回的切片都引用传入的 `body`
+//! 缓冲区（零拷贝）；只有 `Part` 数组和头部列表是从 `allocator` 分配的。
 
 const std = @import("std");
 const http = @import("http.zig");
@@ -41,10 +39,9 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
-/// Parses `body` using the boundary contained in `content_type`.
-/// Returns the parsed parts allocated from `allocator`. The caller owns the
-/// returned slice (free with `freeParts`); slices inside each part reference
-/// `body` and must not outlive it.
+/// 用 `content_type` 中包含的 boundary 解析 `body`。
+/// 返回从 `allocator` 分配的解析结果。返回的切片归调用方所有（用
+/// `freeParts` 释放）；每个 part 内部的切片引用 `body`，不得比它存活更久。
 pub fn parse(allocator: std.mem.Allocator, content_type: []const u8, body: []const u8) ParseError![]Part {
     const boundary = extractBoundary(content_type) orelse {
         if (std.ascii.indexOfIgnoreCase(content_type, "multipart/form-data") == null) {
@@ -53,7 +50,7 @@ pub fn parse(allocator: std.mem.Allocator, content_type: []const u8, body: []con
         return error.MissingBoundary;
     };
 
-    var delimiter_buf: [74]u8 = undefined; // "--" + boundary(<=70) + slack
+    var delimiter_buf: [74]u8 = undefined; // "--" + boundary(<=70) + 余量
     if (boundary.len + 2 > delimiter_buf.len) return error.MalformedBody;
     delimiter_buf[0] = '-';
     delimiter_buf[1] = '-';
@@ -63,16 +60,16 @@ pub fn parse(allocator: std.mem.Allocator, content_type: []const u8, body: []con
     var parts: std.ArrayListUnmanaged(Part) = .empty;
     errdefer freePartsList(allocator, &parts);
 
-    // Find the first boundary.
+    // 找到第一个 boundary。
     var cursor = std.mem.indexOf(u8, body, delimiter) orelse return error.MalformedBody;
     cursor += delimiter.len;
 
     while (true) {
-        // After a delimiter we expect either "--" (terminator) or CRLF.
+        // 一个分隔符之后，期望要么是 "--"（结束符），要么是 CRLF。
         if (cursor + 2 <= body.len and body[cursor] == '-' and body[cursor + 1] == '-') {
-            break; // closing delimiter
+            break; // 结束分隔符
         }
-        // Skip the trailing CRLF after the delimiter.
+        // 跳过分隔符后面的 CRLF。
         if (cursor + 2 <= body.len and body[cursor] == '\r' and body[cursor + 1] == '\n') {
             cursor += 2;
         } else if (cursor < body.len and body[cursor] == '\n') {
@@ -81,15 +78,15 @@ pub fn parse(allocator: std.mem.Allocator, content_type: []const u8, body: []con
             return error.MalformedBody;
         }
 
-        // Header block ends at the first blank line (CRLF CRLF).
+        // 头部块在第一个空行（CRLF CRLF）处结束。
         const header_end = std.mem.indexOf(u8, body[cursor..], "\r\n\r\n") orelse return error.MalformedBody;
         const header_block = body[cursor .. cursor + header_end];
         const data_start = cursor + header_end + 4;
 
-        // The next delimiter (preceded by CRLF) terminates this part's data.
+        // 下一个分隔符（前面带 CRLF）标记本 part 数据的结束。
         const next_rel = std.mem.indexOf(u8, body[data_start..], delimiter) orelse return error.MalformedBody;
         var data_end = data_start + next_rel;
-        // Strip the CRLF that precedes the boundary delimiter.
+        // 去掉 boundary 分隔符前面的 CRLF。
         if (data_end >= 2 and body[data_end - 2] == '\r' and body[data_end - 1] == '\n') {
             data_end -= 2;
         } else if (data_end >= 1 and body[data_end - 1] == '\n') {
@@ -107,28 +104,26 @@ pub fn parse(allocator: std.mem.Allocator, content_type: []const u8, body: []con
     return parts.toOwnedSlice(allocator);
 }
 
-/// Frees a parts slice returned by `parse`.
+/// 释放 `parse` 返回的 parts 切片。
 pub fn freeParts(allocator: std.mem.Allocator, parts: []Part) void {
     for (parts) |part| allocator.free(part.headers);
     allocator.free(parts);
 }
 
-/// Cached result wrapper stored on the request via a pointer attribute.
+/// 缓存结果的包装，通过指针属性存放在请求上。
 const CachedParts = struct {
     parts: []Part,
-    /// Set when parsing failed, so repeat calls return the same error without
-    /// re-parsing. `null` means success.
+    /// 解析失败时设置，使重复调用返回相同的错误而不重新解析。
+    /// `null` 表示成功。
     err: ?ParseError = null,
 };
 
 const cache_attr_key = "zyra.multipart.parts";
 
-/// Parses the request body as `multipart/form-data`, caching the result on the
-/// request so repeated calls within the same request reuse the parsed parts
-/// instead of re-parsing. Allocations use `req.allocator` (request-arena
-/// lifetime); the returned slices reference the request body and must not
-/// outlive the request. Returns `error.NotMultipart` when the request is not
-/// multipart.
+/// 把请求体解析为 `multipart/form-data`，并把结果缓存在请求上，使同一请求
+/// 内的重复调用复用已解析的 parts 而不重新解析。分配使用 `req.allocator`
+/// （请求 arena 生命周期）；返回的切片引用请求体，不得比请求存活更久。
+/// 当请求不是 multipart 时返回 `error.NotMultipart`。
 pub fn cachedParse(req: *http.HttpRequest) ParseError![]Part {
     if (req.getAttributePtr(cache_attr_key)) |ptr| {
         const cached: *CachedParts = @ptrCast(@alignCast(ptr));
@@ -146,7 +141,7 @@ pub fn cachedParse(req: *http.HttpRequest) ParseError![]Part {
     else |e|
         .{ .parts = &.{}, .err = e };
 
-    // Best-effort cache; if storing the attribute fails, still return the result.
+    // 尽力缓存；即使存属性失败，仍返回结果。
     req.setAttributePtr(cache_attr_key, cached) catch {};
 
     if (cached.err) |e| return e;
@@ -158,7 +153,7 @@ fn freePartsList(allocator: std.mem.Allocator, parts: *std.ArrayListUnmanaged(Pa
     parts.deinit(allocator);
 }
 
-/// Returns the first file part with the given form field name.
+/// 返回具有给定表单字段名的第一个文件 part。
 pub fn getFile(parts: []const Part, field_name: []const u8) ?Part {
     for (parts) |part| {
         if (part.isFile() and std.mem.eql(u8, part.name, field_name)) return part;
@@ -166,7 +161,7 @@ pub fn getFile(parts: []const Part, field_name: []const u8) ?Part {
     return null;
 }
 
-/// Returns the value of the first non-file part with the given form field name.
+/// 返回具有给定表单字段名的第一个非文件 part 的值。
 pub fn getField(parts: []const Part, field_name: []const u8) ?[]const u8 {
     for (parts) |part| {
         if (!part.isFile() and std.mem.eql(u8, part.name, field_name)) return part.data;
@@ -174,11 +169,11 @@ pub fn getField(parts: []const Part, field_name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Extracts the boundary token from a `multipart/form-data` content type.
+/// 从 `multipart/form-data` 内容类型中提取 boundary 标记。
 pub fn extractBoundary(content_type: []const u8) ?[]const u8 {
     const idx = std.ascii.indexOfIgnoreCase(content_type, "boundary=") orelse return null;
     var value = content_type[idx + "boundary=".len ..];
-    // Stop at the next parameter separator.
+    // 在下一个参数分隔符处停止。
     if (std.mem.indexOfScalar(u8, value, ';')) |semi| value = value[0..semi];
     value = std.mem.trim(u8, value, " \t");
     if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
@@ -316,7 +311,7 @@ test "cachedParse parses once and reuses the cached result" {
     const first = try cachedParse(&req);
     const second = try cachedParse(&req);
     try std.testing.expectEqual(@as(usize, 2), first.len);
-    // Same backing slice pointer -> the second call reused the cache.
+    // 同一个底层切片指针 -> 第二次调用复用了缓存。
     try std.testing.expectEqual(first.ptr, second.ptr);
     try std.testing.expectEqualStrings("zig-dev", getField(second, "username").?);
 }
@@ -330,6 +325,6 @@ test "cachedParse returns NotMultipart for non-multipart requests" {
     req.body_bytes = "{}";
 
     try std.testing.expectError(error.NotMultipart, cachedParse(&req));
-    // Cached error path: a second call still reports the same error.
+    // 缓存错误路径：第二次调用仍报告相同的错误。
     try std.testing.expectError(error.NotMultipart, cachedParse(&req));
 }

@@ -1,11 +1,10 @@
-//! Comptime route registration ("reflection"-driven routing).
+//! 编译期路由注册（“反射”驱动的路由）。
 //!
-//! Zig has no runtime reflection, but it can introspect types at compile time.
-//! This module lets a handler namespace declare its routes once as a `routes`
-//! table and register them all in a single call, instead of repeating
-//! `router.get(...)` / `router.post(...)` lines.
+//! Zig 没有运行时反射，但可以在编译期对类型做内省。本模块让一个处理函数
+//! 命名空间把自己的路由用一张 `routes` 表声明一次，再用一次调用全部注册，
+//! 而不必重复写 `router.get(...)` / `router.post(...)` 这些行。
 //!
-//! Usage:
+//! 用法：
 //! ```zig
 //! const UserApi = struct {
 //!     pub const routes = [_]meta_routes.RouteDef{
@@ -22,9 +21,8 @@
 //! try meta_routes.registerRoutes(router, UserApi);
 //! ```
 //!
-//! This is the type-safe Zig equivalent of Hical's `HICAL_ROUTES` macro: the
-//! `routes` table is validated at compile time and expanded into ordinary
-//! `Router.route` calls, so there is zero runtime reflection overhead.
+//! 这是 Hical `HICAL_ROUTES` 宏的类型安全 Zig 等价物：`routes` 表在编译期
+//! 校验，并被展开成普通的 `Router.route` 调用，因此没有任何运行时反射开销。
 
 const std = @import("std");
 const http = @import("http.zig");
@@ -34,18 +32,18 @@ const Router = router_mod.Router;
 const RouteGroup = router_mod.RouteGroup;
 const RouteHandler = router_mod.RouteHandler;
 
-/// A single declarative route: HTTP method, path pattern, and handler.
+/// 一条声明式路由：HTTP 方法、路径模式、处理函数。
 pub const RouteDef = struct {
     method: http.HttpMethod,
     path: []const u8,
     handler: RouteHandler,
 };
 
-/// Registers every route declared in `Handlers.routes` on `router`.
+/// 把 `Handlers.routes` 中声明的每条路由注册到 `router` 上。
 ///
-/// `Handlers` must expose a public `routes` declaration that is an array or
-/// slice of `RouteDef`. The table is read at compile time; a missing or
-/// mis-typed `routes` declaration is a compile error.
+/// `Handlers` 必须暴露一个公共的 `routes` 声明，且它是 `RouteDef` 的数组
+/// 或切片。该表在编译期被读取；缺失或类型不符的 `routes` 声明会触发编译
+/// 错误。
 pub fn registerRoutes(router: *Router, comptime Handlers: type) !void {
     comptime validateRoutes(Handlers);
     inline for (Handlers.routes) |def| {
@@ -53,8 +51,8 @@ pub fn registerRoutes(router: *Router, comptime Handlers: type) !void {
     }
 }
 
-/// Like `registerRoutes`, but registers onto a `RouteGroup` so the group's
-/// middleware applies to every declared route.
+/// 同 `registerRoutes`，但注册到 `RouteGroup` 上，使组的中间件作用于每条
+/// 声明的路由。
 pub fn registerGroupRoutes(group: *RouteGroup, comptime Handlers: type) !void {
     comptime validateRoutes(Handlers);
     inline for (Handlers.routes) |def| {
@@ -62,7 +60,7 @@ pub fn registerGroupRoutes(group: *RouteGroup, comptime Handlers: type) !void {
     }
 }
 
-/// Compile-time check that `Handlers` exposes a usable `routes` table.
+/// 编译期检查：确认 `Handlers` 暴露了一张可用的 `routes` 表。
 fn validateRoutes(comptime Handlers: type) void {
     if (!@hasDecl(Handlers, "routes")) {
         @compileError(@typeName(Handlers) ++ " has no public `routes` declaration");
@@ -75,7 +73,7 @@ fn validateRoutes(comptime Handlers: type) void {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// 测试
 // ---------------------------------------------------------------------------
 
 const TestApi = struct {
@@ -102,19 +100,19 @@ test "registerRoutes registers every declared route" {
 
     try registerRoutes(&router, TestApi);
 
-    // Each declared route dispatches to its handler.
+    // 每条声明的路由都能分派到各自的处理函数。
     var req_ping: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/api/ping", .target = "/api/ping" };
     try std.testing.expectEqualStrings("pong", (try router.dispatch(&req_ping)).body);
 
     var req_echo: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .post, .path = "/api/echo", .target = "/api/echo" };
     try std.testing.expectEqualStrings("echo", (try router.dispatch(&req_echo)).body);
 
-    // The dynamic route captured its path parameter.
+    // 动态路由捕获到了它的路径参数。
     var req_item: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/api/items/42", .target = "/api/items/42" };
     defer req_item.deinit();
     try std.testing.expectEqualStrings("42", (try router.dispatch(&req_item)).body);
 
-    // A method that was not declared yields 405 (path exists for GET only).
+    // 未声明的方法返回 405（该路径只为 GET 存在）。
     var req_bad: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .delete, .path = "/api/ping", .target = "/api/ping" };
     try std.testing.expectEqual(http.HttpStatus.method_not_allowed, (try router.dispatch(&req_bad)).status);
 }

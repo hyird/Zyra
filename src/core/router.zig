@@ -4,39 +4,35 @@ const websocket = @import("websocket.zig");
 
 pub const RouteHandler = *const fn (*http.HttpRequest) anyerror!http.HttpResponse;
 
-/// A synchronous "before" hook for a route group. Returning a response
-/// short-circuits the route (and runs the already-entered groups' `after`
-/// hooks); returning `null` continues to the next group hook or the handler.
+/// 路由组的同步“before”钩子。返回响应会短路该路由（并运行已进入的组的
+/// `after` 钩子）；返回 `null` 则继续下一个组钩子或处理函数。
 pub const GroupBeforeHandler = *const fn (*http.HttpRequest) anyerror!?http.HttpResponse;
 
-/// A synchronous "after" hook for a route group. Runs after the handler (or a
-/// short-circuiting `before`) produces a response and may mutate it.
+/// 路由组的同步“after”钩子。在处理函数（或短路的 `before`）产生响应后
+/// 运行，可以修改该响应。
 pub const GroupAfterHandler = *const fn (*http.HttpRequest, *http.HttpResponse) anyerror!void;
 
-/// One group-level middleware: an optional before hook and an optional after
-/// hook. Applied only to routes registered through the owning `RouteGroup`.
+/// 一条组级中间件：一个可选的 before 钩子和一个可选的 after 钩子。仅作用
+/// 于通过其所属 `RouteGroup` 注册的路由。
 pub const GroupMiddleware = struct {
     before: ?GroupBeforeHandler = null,
     after: ?GroupAfterHandler = null,
 };
 
-/// Handler for an upgraded WebSocket connection. Runs the receive/send loop and
-/// returns when the connection should be closed.
+/// 已升级的 WebSocket 连接的处理函数。运行收发循环，并在连接应关闭时返回。
 pub const WsHandler = *const fn (*websocket.WebSocketSession) anyerror!void;
 
 const method_count = @typeInfo(http.HttpMethod).@"enum".fields.len;
 
-/// A stored route: the user's handler plus the (possibly empty) chain of
-/// group-level middleware that wraps it. The middleware slice is borrowed and
-/// must outlive the router (group middleware chains are owned by the router's
-/// `owned_chains` arena-like list).
+/// 一条已存储的路由：用户的处理函数，加上包裹它的（可能为空的）组级中间件
+/// 链。该中间件切片是借用的，必须比路由器存活更久（组中间件链由路由器的
+/// 类 arena 列表 `owned_chains` 所有）。
 pub const RouteEndpoint = struct {
     handler: RouteHandler,
     middleware: []const GroupMiddleware = &.{},
 
-    /// Runs the group middleware chain (before hooks in order, after hooks in
-    /// reverse) around the handler. A short-circuiting before hook still runs
-    /// the after hooks of the groups already entered.
+    /// 围绕处理函数运行组中间件链（before 钩子按顺序，after 钩子逆序）。
+    /// 短路的 before 钩子仍会运行已进入的那些组的 after 钩子。
     pub fn invoke(self: RouteEndpoint, req: *http.HttpRequest) anyerror!http.HttpResponse {
         var entered: usize = 0;
         for (self.middleware) |mw| {
@@ -74,8 +70,8 @@ pub const Router = struct {
     param_routes: [method_count]std.ArrayListUnmanaged(RouteEntry) = .{std.ArrayListUnmanaged(RouteEntry).empty} ** method_count,
     path_methods: std.StringHashMapUnmanaged(u16) = .{},
     owned_paths: std.ArrayListUnmanaged([]const u8) = .empty,
-    /// Owns the merged group-middleware chains created by `RouteGroup`s, freed
-    /// in `deinit`. Endpoints borrow slices from these.
+    /// 拥有由 `RouteGroup` 创建的合并后组中间件链，在 `deinit` 中释放。
+    /// 端点从中借用切片。
     owned_chains: std.ArrayListUnmanaged([]GroupMiddleware) = .empty,
     ws_routes: std.StringHashMapUnmanaged(WsHandler) = .{},
 
@@ -98,9 +94,8 @@ pub const Router = struct {
         try self.routeEndpoint(method, path, .{ .handler = handler });
     }
 
-    /// Registers a route carrying an explicit endpoint (handler + group
-    /// middleware chain). Used by `RouteGroup` to attach group-scoped
-    /// middleware; most callers use `route`/the verb helpers instead.
+    /// 注册一条携带显式端点（处理函数 + 组中间件链）的路由。由 `RouteGroup`
+    /// 用于附加组作用域的中间件；大多数调用方应改用 `route`/动词辅助函数。
     pub fn routeEndpoint(self: *Router, method: http.HttpMethod, path: []const u8, endpoint: RouteEndpoint) !void {
         const index = methodIndex(method);
         if (isParamPath(path)) {
@@ -146,21 +141,20 @@ pub const Router = struct {
         try self.route(.options, path, handler);
     }
 
-    /// Registers a WebSocket handler for an exact path. The connection is
-    /// upgraded automatically when a client sends a WebSocket upgrade request
-    /// for this path.
+    /// 为精确路径注册一个 WebSocket 处理函数。当客户端为该路径发送
+    /// WebSocket 升级请求时，连接会自动升级。
     pub fn ws(self: *Router, path: []const u8, handler: WsHandler) !void {
         try self.ws_routes.put(self.allocator, path, handler);
     }
 
-    /// Looks up the WebSocket handler registered for an exact path, if any.
+    /// 查找为精确路径注册的 WebSocket 处理函数（若有）。
     pub fn wsHandler(self: *const Router, path: []const u8) ?WsHandler {
         return self.ws_routes.get(path);
     }
 
-    /// Calls `callback(ctx, method, path)` for every registered HTTP route
-    /// (static and parameterized), in no particular order. Used for
-    /// introspection such as OpenAPI document generation.
+    /// 对每条已注册的 HTTP 路由（静态和带参数的）调用
+    /// `callback(ctx, method, path)`，顺序不定。用于内省，例如生成 OpenAPI
+    /// 文档。
     pub fn forEachRoute(
         self: *const Router,
         ctx: anytype,
@@ -245,20 +239,18 @@ fn allowHeader(bits: u16) []const u8 {
 pub const RouteGroup = struct {
     router: *Router,
     prefix: []const u8,
-    /// Group-level middleware accumulated via `use`/`useBeforeAfter`, applied to
-    /// every route registered through this group (and inherited by subgroups).
-    /// Backed by the router's allocator; the storage is freed with the router.
+    /// 通过 `use`/`useBeforeAfter` 累积的组级中间件，作用于通过本组注册的
+    /// 每条路由（并被子组继承）。由路由器的分配器支撑；存储随路由器一起释放。
     chain: std.ArrayListUnmanaged(GroupMiddleware) = .empty,
 
-    /// Adds a full before/after group middleware. Affects only routes
-    /// registered through this group after the call. Returns the group for
-    /// chaining.
+    /// 添加一条完整的 before/after 组中间件。仅影响本次调用之后通过本组
+    /// 注册的路由。返回本组以便链式调用。
     pub fn use(self: *RouteGroup, middleware: GroupMiddleware) !*RouteGroup {
         try self.chain.append(self.router.allocator, middleware);
         return self;
     }
 
-    /// Adds a before hook (and optional after hook) as group middleware.
+    /// 添加一个 before 钩子（和可选的 after 钩子）作为组中间件。
     pub fn useBeforeAfter(
         self: *RouteGroup,
         before: ?GroupBeforeHandler,
@@ -267,8 +259,8 @@ pub const RouteGroup = struct {
         return self.use(.{ .before = before, .after = after });
     }
 
-    /// Snapshots the current middleware chain into router-owned storage so the
-    /// endpoint can borrow a stable slice independent of later `use` calls.
+    /// 把当前中间件链快照到路由器拥有的存储中，使端点可以借用一个稳定的
+    /// 切片，不受后续 `use` 调用影响。
     fn snapshotChain(self: *RouteGroup) ![]const GroupMiddleware {
         if (self.chain.items.len == 0) return &.{};
         const copy = try self.router.allocator.dupe(GroupMiddleware, self.chain.items);
@@ -317,9 +309,8 @@ pub const RouteGroup = struct {
         try self.route(.options, path, handler);
     }
 
-    /// Creates a nested subgroup. The subgroup inherits this group's prefix and
-    /// a copy of its current middleware chain; further `use` calls on either
-    /// group are independent thereafter.
+    /// 创建一个嵌套子组。子组继承本组的前缀和其当前中间件链的一份副本；
+    /// 此后对任一组的 `use` 调用互不影响。
     pub fn group(self: *RouteGroup, sub_prefix: []const u8) !RouteGroup {
         const joined = try joinPath(self.router.allocator, self.prefix, sub_prefix);
         errdefer self.router.allocator.free(joined);
@@ -349,20 +340,20 @@ fn isParamPath(path: []const u8) bool {
         std.mem.indexOfScalar(u8, path, '*') != null;
 }
 
-/// True for a trailing catch-all segment: `*`, `*name`, or `{*name}`.
-/// A catch-all captures the entire remainder of the request path (including any
-/// embedded slashes) and must be the last segment of the pattern.
+/// 对末尾的 catch-all 段返回 true：`*`、`*name` 或 `{*name}`。
+/// catch-all 捕获请求路径的整个剩余部分（包括其中嵌入的斜杠），且必须是
+/// 模式的最后一段。
 fn isWildcardSegment(segment: []const u8) bool {
     if (segment.len == 0) return false;
-    if (segment[0] == '*') return true; // `*` or `*name`
+    if (segment[0] == '*') return true; // `*` 或 `*name`
     if (isParamSegment(segment) and segment[1] == '*') return true; // `{*name}`
     return false;
 }
 
-/// Returns the capture name for a wildcard segment (may be empty for a bare
-/// `*`). Assumes `isWildcardSegment(segment)` is true.
+/// 返回通配段的捕获名（对裸 `*` 可能为空）。前提是
+/// `isWildcardSegment(segment)` 为 true。
 fn wildcardName(segment: []const u8) []const u8 {
-    if (segment[0] == '*') return segment[1..]; // `*name` -> `name`, `*` -> ``
+    if (segment[0] == '*') return segment[1..]; // `*name` -> `name`，`*` -> ``
     return segment[2 .. segment.len - 1]; // `{*name}` -> `name`
 }
 
@@ -375,8 +366,8 @@ fn matchParamPath(pattern_raw: []const u8, path_raw: []const u8, req: *http.Http
         const p_seg = nextSegment(&pattern);
         if (p_seg) |p| {
             if (isWildcardSegment(p)) {
-                // Catch-all: bind the entire remaining path and finish. The
-                // wildcard must be the final pattern segment.
+                // catch-all：绑定整个剩余路径并结束。通配段必须是模式的
+                // 最后一段。
                 if (pattern.len != 0) return false;
                 const name = wildcardName(p);
                 if (name.len > 0) try req.setParam(name, remainder);
@@ -620,7 +611,7 @@ test "ws handler registration and lookup" {
     try router.ws("/chat", handler);
     try std.testing.expect(router.wsHandler("/chat") != null);
     try std.testing.expect(router.wsHandler("/other") == null);
-    // ws routes are independent of HTTP route count.
+    // ws 路由与 HTTP 路由计数无关。
     try std.testing.expectEqual(@as(usize, 0), router.routeCount());
 }
 
@@ -654,7 +645,7 @@ test "star-prefixed and bare wildcard segments" {
     var req1: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/assets/css/app.css", .target = "/assets/css/app.css" };
     try std.testing.expectEqualStrings("css/app.css", (try router.dispatch(&req1)).body);
 
-    // Bare wildcard matches but captures nothing.
+    // 裸通配匹配但不捕获任何内容。
     var req2: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/catch/anything/here", .target = "/catch/anything/here" };
     try std.testing.expectEqualStrings("caught", (try router.dispatch(&req2)).body);
 }
@@ -673,7 +664,7 @@ test "wildcard combines with leading fixed and param segments" {
     var req: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/u/7/files/deep/nested.bin", .target = "/u/7/files/deep/nested.bin" };
     try std.testing.expectEqualStrings("deep/nested.bin", (try router.dispatch(&req)).body);
 
-    // Non-matching prefix still 404s.
+    // 不匹配的前缀仍返回 404。
     var req_nf: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/u/7/other/x", .target = "/u/7/other/x" };
     try std.testing.expectEqual(http.HttpStatus.not_found, (try router.dispatch(&req_nf)).status);
 }
@@ -713,15 +704,15 @@ test "group middleware wraps only group routes (before/after order)" {
     _ = try api.useBeforeAfter(hooks.before, hooks.after);
     try api.get("/users", textHandler("users"));
 
-    // A route outside the group: no group middleware runs.
+    // 组外的路由：不运行任何组中间件。
     try router.get("/public", textHandler("public"));
 
-    // Group route: before -> handler -> after.
+    // 组内路由：before -> handler -> after。
     var req_api: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/api/users", .target = "/api/users" };
     try std.testing.expectEqualStrings("users", (try router.dispatch(&req_api)).body);
     try std.testing.expectEqualStrings("ba", GroupTrace.slice());
 
-    // Non-group route: trace unchanged.
+    // 非组路由：trace 不变。
     GroupTrace.reset();
     var req_pub: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/public", .target = "/public" };
     try std.testing.expectEqualStrings("public", (try router.dispatch(&req_pub)).body);
@@ -787,10 +778,10 @@ test "nested group inherits parent middleware and adds its own" {
     _ = try admin.useBeforeAfter(hooks.innerBefore, hooks.innerAfter);
     try admin.get("/stats", textHandler("stats"));
 
-    // Outer-only route is unaffected by the inner middleware.
+    // 仅外层的路由不受内层中间件影响。
     try api.get("/ping", textHandler("ping"));
 
-    // Nested route: outer-before, inner-before, handler, inner-after, outer-after.
+    // 嵌套路由：外层 before、内层 before、handler、内层 after、外层 after。
     var req: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/api/admin/stats", .target = "/api/admin/stats" };
     try std.testing.expectEqualStrings("stats", (try router.dispatch(&req)).body);
     try std.testing.expectEqualStrings("12BA", GroupTrace.slice());

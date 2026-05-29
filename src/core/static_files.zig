@@ -1,15 +1,15 @@
-//! Static file serving.
+//! 静态文件服务。
 //!
-//! `StaticFiles` maps a URL prefix onto a local directory and serves files with
-//! MIME detection, ETag / If-None-Match (304), HTTP Range requests (206/416),
-//! and path-traversal protection. The pure helpers (`mimeType`, `makeEtag`,
-//! `parseByteRange`, `isSafeRelPath`) are independently testable; actual file
-//! I/O uses the runtime `std.Io` carried by the request.
+//! `StaticFiles` 把一个 URL 前缀映射到本地目录，并提供文件服务，支持 MIME
+//! 检测、ETag / If-None-Match（304）、HTTP Range 请求（206/416）以及路径
+//! 穿越防护。纯辅助函数（`mimeType`、`makeEtag`、`parseByteRange`、
+//! `isSafeRelPath`）可独立测试；实际的文件 I/O 使用请求携带的运行时
+//! `std.Io`。
 
 const std = @import("std");
 const http = @import("http.zig");
 
-/// Returns the MIME type for a file extension (including the leading dot).
+/// 返回文件扩展名（含前导点）对应的 MIME 类型。
 pub fn mimeType(ext: []const u8) []const u8 {
     const table = [_]struct { ext: []const u8, mime: []const u8 }{
         .{ .ext = ".html", .mime = "text/html; charset=utf-8" },
@@ -46,25 +46,25 @@ pub fn mimeType(ext: []const u8) []const u8 {
     return "application/octet-stream";
 }
 
-/// Builds a quoted ETag from file size and modification timestamp (nanoseconds).
+/// 由文件大小和修改时间戳（纳秒）构建一个带引号的 ETag。
 pub fn makeEtag(buffer: []u8, file_size: u64, mtime_ns: i128) ![]const u8 {
     return std.fmt.bufPrint(buffer, "\"{d}-{d}\"", .{ file_size, mtime_ns });
 }
 
 pub const ByteRange = struct {
     start: u64,
-    end: u64, // inclusive
+    end: u64, // 闭区间，含 end
 };
 
 pub const RangeResult = union(enum) {
-    none, // no/invalid syntax but not unsatisfiable: serve full
+    none, // 无/无效语法但并非不可满足：提供完整文件
     range: ByteRange,
-    unsatisfiable, // valid syntax but out of bounds -> 416
-    multi, // multi-range, not supported -> serve full
+    unsatisfiable, // 语法有效但越界 -> 416
+    multi, // 多段范围，不支持 -> 提供完整文件
 };
 
-/// Parses a `Range` header value against `file_size`.
-/// Supports `bytes=0-499`, `bytes=500-`, and `bytes=-500`.
+/// 针对 `file_size` 解析一个 `Range` 头部的值。
+/// 支持 `bytes=0-499`、`bytes=500-` 和 `bytes=-500`。
 pub fn parseByteRange(header: []const u8, file_size: u64) RangeResult {
     if (header.len < 7 or !std.mem.startsWith(u8, header, "bytes=")) return .none;
     const spec = header[6..];
@@ -79,7 +79,7 @@ pub fn parseByteRange(header: []const u8, file_size: u64) RangeResult {
     var end: u64 = file_size - 1;
 
     if (start_str.len == 0) {
-        // Suffix form "bytes=-N": last N bytes.
+        // 后缀形式 "bytes=-N"：取最后 N 个字节。
         if (end_str.len == 0) return .none;
         const suffix = std.fmt.parseInt(u64, end_str, 10) catch return .none;
         if (suffix == 0) return .unsatisfiable;
@@ -97,15 +97,14 @@ pub fn parseByteRange(header: []const u8, file_size: u64) RangeResult {
     return .{ .range = .{ .start = start, .end = end } };
 }
 
-/// Validates a request-relative path, rejecting traversal (`..`), absolute
-/// paths, and Windows drive/backslash tricks. Returns the cleaned relative path
-/// (leading slashes trimmed) or null if unsafe.
+/// 校验一个相对请求路径，拒绝穿越（`..`）、绝对路径以及 Windows 盘符/
+/// 反斜杠技巧。返回清理后的相对路径（去掉前导斜杠），不安全则返回 null。
 pub fn isSafeRelPath(path: []const u8) ?[]const u8 {
     var rel = path;
     while (rel.len > 0 and rel[0] == '/') rel = rel[1..];
 
     if (rel.len == 0) return rel;
-    // Reject NUL and backslashes outright.
+    // 直接拒绝 NUL 和反斜杠。
     if (std.mem.indexOfScalar(u8, rel, 0) != null) return null;
     if (std.mem.indexOfScalar(u8, rel, '\\') != null) return null;
 
@@ -121,9 +120,9 @@ pub const StaticFiles = struct {
     root: []const u8,
     url_prefix: []const u8,
     max_file_size: u64 = 64 * 1024 * 1024,
-    /// Optional path-resolution cache. When set, the resolved disk path plus the
-    /// last-known size/mtime/etag/mime are cached per request-relative path for
-    /// `cache_ttl_ns`, so repeat requests skip the `path.join` + `stat` work.
+    /// 可选的路径解析缓存。设置后，会按相对请求路径缓存解析出的磁盘路径
+    /// 以及最近一次的 size/mtime/etag/mime，缓存时长为 `cache_ttl_ns`，从而
+    /// 让重复请求跳过 `path.join` + `stat` 的开销。
     cache: ?*PathCache = null,
     cache_ttl_ns: i128 = 60 * std.time.ns_per_s,
 
@@ -131,15 +130,15 @@ pub const StaticFiles = struct {
         return .{ .root = root, .url_prefix = url_prefix };
     }
 
-    /// Like `init`, but allocates a path-resolution cache. The returned value
-    /// owns the cache; call `deinit` to release it.
+    /// 与 `init` 类似，但会分配一个路径解析缓存。返回值拥有该缓存；调用
+    /// `deinit` 释放它。
     pub fn initCached(allocator: std.mem.Allocator, root: []const u8, url_prefix: []const u8) !StaticFiles {
         const cache = try allocator.create(PathCache);
         cache.* = PathCache.init(allocator);
         return .{ .root = root, .url_prefix = url_prefix, .cache = cache };
     }
 
-    /// Frees the path-resolution cache, if one was allocated by `initCached`.
+    /// 释放路径解析缓存（若由 `initCached` 分配过）。
     pub fn deinit(self: *StaticFiles, allocator: std.mem.Allocator) void {
         if (self.cache) |cache| {
             cache.deinit();
@@ -148,9 +147,8 @@ pub const StaticFiles = struct {
         }
     }
 
-    /// A single cached resolution: the on-disk path and the file metadata
-    /// observed when it was cached. `disk_path`/`etag`/`mime` are owned by the
-    /// cache allocator and persist until the entry is evicted.
+    /// 单条缓存解析结果：磁盘路径以及缓存时观测到的文件元数据。
+    /// `disk_path`/`etag`/`mime` 由缓存分配器拥有，在条目被驱逐前一直有效。
     pub const CacheEntry = struct {
         disk_path: []const u8,
         file_size: u64,
@@ -161,8 +159,8 @@ pub const StaticFiles = struct {
         last_use: u64,
     };
 
-    /// Bounded LRU-by-`last_use` cache of resolved paths, guarded by a
-    /// `std.Io.Mutex` so concurrent request fibers can share it safely.
+    /// 按 `last_use` 做 LRU 的有界已解析路径缓存，由 `std.Io.Mutex` 保护，
+    /// 使并发的请求 fiber 能安全共享。
     pub const PathCache = struct {
         allocator: std.mem.Allocator,
         mutex: std.Io.Mutex = .init,
@@ -187,10 +185,10 @@ pub const StaticFiles = struct {
         fn freeEntry(self: *PathCache, entry: *CacheEntry) void {
             self.allocator.free(entry.disk_path);
             self.allocator.free(entry.etag);
-            // `mime` points into the static `mimeType` table — not owned.
+            // `mime` 指向静态 `mimeType` 表 —— 非本缓存所有。
         }
 
-        /// Evicts the entry with the smallest `last_use` (least recently used).
+        /// 驱逐 `last_use` 最小（最久未使用）的条目。
         fn evictOne(self: *PathCache) void {
             var it = self.map.iterator();
             var victim_key: ?[]const u8 = null;
@@ -211,8 +209,8 @@ pub const StaticFiles = struct {
         }
     };
 
-    /// Resolves the request path to a relative file path under `root`, applying
-    /// the URL prefix and traversal protection. Returns null if unsafe.
+    /// 将请求路径解析为 `root` 下的相对文件路径，应用 URL 前缀并做穿越
+    /// 防护。不安全则返回 null。
     pub fn resolveRelPath(self: StaticFiles, request_path: []const u8) ?[]const u8 {
         var p = request_path;
         if (std.mem.startsWith(u8, p, self.url_prefix)) {
@@ -221,7 +219,7 @@ pub const StaticFiles = struct {
         return isSafeRelPath(p);
     }
 
-    /// Serves the file referenced by `req`. Requires `req.io` to be set.
+    /// 提供 `req` 所引用的文件。要求已设置 `req.io`。
     pub fn serve(self: StaticFiles, req: *http.HttpRequest) !http.HttpResponse {
         const io = req.io orelse return http.HttpResponse.serverError();
         const allocator = req.allocator;
@@ -232,10 +230,9 @@ pub const StaticFiles = struct {
         };
         const effective_rel = if (rel.len == 0) "index.html" else rel;
 
-        // Try the path-resolution cache: if we have a fresh entry, reuse the
-        // resolved disk path and file metadata without re-running stat. The
-        // cached strings are duped into the request arena so they stay valid for
-        // the response even if the entry is evicted concurrently afterwards.
+        // 尝试路径解析缓存：若命中且条目仍新鲜，则复用解析出的磁盘路径与
+        // 文件元数据，无需重新 stat。缓存的字符串会复制到请求 arena，因此即便
+        // 之后该条目被并发驱逐，它们对本次响应仍然有效。
         if (self.cache) |cache| {
             const now = std.Io.Clock.now(.awake, io).nanoseconds;
             cache.mutex.lockUncancelable(io);
@@ -258,7 +255,7 @@ pub const StaticFiles = struct {
             cache.mutex.unlock(io);
         }
 
-        // Cache miss (or no cache): resolve + stat from disk.
+        // 缓存未命中（或无缓存）：从磁盘解析 + stat。
         const disk_path = try std.fs.path.join(allocator, &.{ self.root, effective_rel });
 
         var dir = std.Io.Dir.cwd();
@@ -287,8 +284,7 @@ pub const StaticFiles = struct {
         const ext = std.fs.path.extension(effective_rel);
         const mime = mimeType(ext);
 
-        // Populate the cache for next time (best-effort; ignore allocation
-        // failures by simply not caching).
+        // 为下次填充缓存（尽力而为；分配失败则直接不缓存）。
         if (self.cache) |cache| {
             self.cacheStore(cache, io, effective_rel, disk_path, file_size, mtime_ns, etag_owned, mime);
         }
@@ -296,8 +292,8 @@ pub const StaticFiles = struct {
         return self.respondFor(req, disk_path, file_size, etag_owned, mime);
     }
 
-    /// Stores a freshly resolved entry into the cache, evicting the LRU victim
-    /// when full. Failures are swallowed (caching is best-effort).
+    /// 将一条新解析的条目存入缓存，满时驱逐 LRU 牺牲者。失败会被吞掉
+    /// （缓存为尽力而为）。
     fn cacheStore(
         self: StaticFiles,
         cache: *PathCache,
@@ -313,7 +309,7 @@ pub const StaticFiles = struct {
         cache.mutex.lockUncancelable(io);
         defer cache.mutex.unlock(io);
 
-        // Refresh an existing entry in place.
+        // 就地刷新已有条目。
         if (cache.map.getPtr(rel)) |entry| {
             cache.allocator.free(entry.disk_path);
             cache.allocator.free(entry.etag);
@@ -356,8 +352,8 @@ pub const StaticFiles = struct {
         };
     }
 
-    /// Builds the actual HTTP response (304 / 206 / 200) from resolved metadata.
-    /// All slice arguments must outlive the response (request-arena lifetime).
+    /// 根据已解析的元数据构建实际的 HTTP 响应（304 / 206 / 200）。
+    /// 所有切片参数的生命周期都必须长于响应（请求 arena 的生命周期）。
     fn respondFor(
         self: StaticFiles,
         req: *http.HttpRequest,
@@ -368,7 +364,7 @@ pub const StaticFiles = struct {
     ) !http.HttpResponse {
         _ = self;
 
-        // 304 Not Modified.
+        // 304 Not Modified。
         if (req.header("if-none-match")) |inm| {
             if (std.mem.eql(u8, inm, etag_owned)) {
                 var res = http.HttpResponse{ .status = .not_modified, .body = "" };
@@ -377,7 +373,7 @@ pub const StaticFiles = struct {
             }
         }
 
-        // Range handling.
+        // Range 处理。
         if (req.header("range")) |range_header| {
             const if_range = req.header("if-range");
             const range_valid = if_range == null or std.mem.eql(u8, if_range.?, etag_owned);
@@ -386,7 +382,7 @@ pub const StaticFiles = struct {
                     .unsatisfiable => return http.HttpResponse.rangeNotSatisfiable(file_size),
                     .range => |r| {
                         const len: u64 = r.end - r.start + 1;
-                        // Stream the requested range from disk (constant memory).
+                        // 从磁盘流式传输请求的范围（常量内存）。
                         var res = http.HttpResponse.fileBody(.partial_content, mime, disk_path, r.start, len);
                         res.setContentRange(r.start, r.end, file_size);
                         try res.setHeader("accept-ranges", "bytes");

@@ -2,31 +2,28 @@ const std = @import("std");
 const http = @import("http.zig");
 const router_mod = @import("router.zig");
 
-/// Onion-model middleware handler.
+/// 洋葱模型中间件处理函数。
 ///
-/// Each handler receives the request and a `*Next`. Calling `next.run(req)`
-/// invokes the next middleware in the chain (or the final router dispatch when
-/// the chain is exhausted). A handler may run logic before and after the
-/// `next.run` call (the onion model), short-circuit by returning a response
-/// without calling `next`, or transform the response returned by `next`.
+/// 每个处理函数接收请求和一个 `*Next`。调用 `next.run(req)` 会调用链中的
+/// 下一个中间件（链耗尽时则进行最终的路由分派）。处理函数可以在 `next.run`
+/// 调用前后运行逻辑（洋葱模型），可以不调用 `next` 直接返回响应来短路，
+/// 也可以变换 `next` 返回的响应。
 pub const MiddlewareHandler = *const fn (*http.HttpRequest, *Next) anyerror!http.HttpResponse;
 
-/// Onion-model middleware that carries an opaque context pointer, enabling
-/// stateful middleware (CORS options, session managers, loggers) without heap
-/// closures. The context is supplied at registration time via
-/// `useOnionCtx`/`useOnionCtxValue` and passed back to the handler unchanged.
+/// 携带不透明上下文指针的洋葱模型中间件，使有状态中间件（CORS 选项、会话
+/// 管理器、日志器）无需堆上闭包即可实现。上下文在注册时通过
+/// `useOnionCtx`/`useOnionCtxValue` 提供，并原样回传给处理函数。
 pub const ContextHandler = *const fn (*anyopaque, *http.HttpRequest, *Next) anyerror!http.HttpResponse;
 
-/// A synchronous "before" hook. Returning a response short-circuits the chain;
-/// returning `null` continues to the next middleware/handler.
+/// 同步“before”钩子。返回响应会短路整条链；返回 `null` 则继续到下一个
+/// 中间件/处理函数。
 pub const BeforeHandler = *const fn (*http.HttpRequest) anyerror!?http.HttpResponse;
 
-/// A synchronous "after" hook. Runs after the downstream response is produced
-/// and may mutate response headers/status. Must not change the body length in a
-/// way that conflicts with an already-computed Content-Length.
+/// 同步“after”钩子。在下游响应产生后运行，可以修改响应头部/状态。不得以
+/// 与已计算的 Content-Length 冲突的方式改变响应体长度。
 pub const AfterHandler = *const fn (*http.HttpRequest, *http.HttpResponse) anyerror!void;
 
-/// Backwards-compatible alias for the simple before-style middleware.
+/// 简单 before 风格中间件的向后兼容别名。
 pub const Middleware = BeforeHandler;
 
 const EntryKind = enum { onion, before, before_after, context };
@@ -40,15 +37,14 @@ const Entry = struct {
     context: ?*anyopaque = null,
 };
 
-/// Walks the middleware chain for a single request. Cheap to construct (no heap
-/// allocation): it holds pointers to the pipeline and router plus a cursor.
+/// 为单个请求遍历中间件链。构造廉价（无堆分配）：它只持有指向流水线和
+/// 路由器的指针，以及一个游标。
 pub const Next = struct {
     pipeline: *const MiddlewarePipeline,
     router: *const router_mod.Router,
     index: usize = 0,
 
-    /// Runs the next middleware in the chain, or dispatches to the router when
-    /// the chain is exhausted.
+    /// 运行链中的下一个中间件，链耗尽时则分派到路由器。
     pub fn run(self: *Next, req: *http.HttpRequest) anyerror!http.HttpResponse {
         const entries = self.pipeline.entries.items;
         while (self.index < entries.len) {
@@ -84,20 +80,19 @@ pub const MiddlewarePipeline = struct {
         self.entries.deinit(self.allocator);
     }
 
-    /// Registers a simple before-style middleware (short-circuit on response).
+    /// 注册一个简单的 before 风格中间件（返回响应即短路）。
     pub fn use(self: *MiddlewarePipeline, middleware: BeforeHandler) !void {
         try self.entries.append(self.allocator, .{ .kind = .before, .before = middleware });
     }
 
-    /// Registers a full onion-model middleware that controls calling `next`.
+    /// 注册一个完整的洋葱模型中间件，由它控制是否调用 `next`。
     pub fn useOnion(self: *MiddlewarePipeline, middleware: MiddlewareHandler) !void {
         try self.entries.append(self.allocator, .{ .kind = .onion, .onion = middleware });
     }
 
-    /// Registers a context-carrying onion middleware. The opaque `context`
-    /// pointer is passed back to `handler` on every request, enabling stateful
-    /// middleware without heap-allocated closures. The caller owns `context`
-    /// and must keep it alive for the lifetime of the pipeline.
+    /// 注册一个携带上下文的洋葱中间件。不透明的 `context` 指针在每次请求时
+    /// 回传给 `handler`，使有状态中间件无需堆分配闭包即可实现。`context` 归
+    /// 调用方所有，且必须在整条流水线生命周期内保持存活。
     pub fn useOnionCtx(
         self: *MiddlewarePipeline,
         context: *anyopaque,
@@ -110,7 +105,7 @@ pub const MiddlewarePipeline = struct {
         });
     }
 
-    /// Registers a before/after pair sharing a single chain frame.
+    /// 注册一对共享单个链帧的 before/after 钩子。
     pub fn useBeforeAfter(self: *MiddlewarePipeline, before: BeforeHandler, after: ?AfterHandler) !void {
         try self.entries.append(self.allocator, .{ .kind = .before_after, .before = before, .after = after });
     }
