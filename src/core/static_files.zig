@@ -253,3 +253,131 @@ test "resolveRelPath strips url prefix" {
     try std.testing.expectEqualStrings("app.js", sf.resolveRelPath("/static/app.js").?);
     try std.testing.expect(sf.resolveRelPath("/static/../secret") == null);
 }
+
+const zio = @import("zio");
+
+const SmokeState = struct {
+    io: std.Io,
+    dir: []const u8,
+    arena: std.mem.Allocator,
+    err: ?anyerror = null,
+    full_status: http.HttpStatus = .internal_server_error,
+    full_body: []const u8 = "",
+    full_etag: []const u8 = "",
+    notmod_status: http.HttpStatus = .internal_server_error,
+    range_status: http.HttpStatus = .internal_server_error,
+    range_body: []const u8 = "",
+    range_content_range_present: bool = false,
+    notfound_status: http.HttpStatus = .ok,
+};
+
+fn smokeRun(state: *SmokeState) std.Io.Cancelable!void {
+    smokeImpl(state) catch |err| {
+        state.err = err;
+    };
+}
+
+fn smokeImpl(state: *SmokeState) anyerror!void {
+    const io = state.io;
+
+    // Create a temp dir + file using the same std.Io backend serve() reads.
+    var cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, state.dir) catch {};
+    try cwd.createDirPath(io, state.dir);
+    defer cwd.deleteTree(io, state.dir) catch {};
+
+    const file_rel = try std.fmt.allocPrint(state.arena, "{s}/hello.txt", .{state.dir});
+    {
+        // zio's std.Io backend supports positional file writes (not streaming).
+        var f = try cwd.createFile(io, file_rel, .{});
+        defer f.close(io);
+        try f.writePositionalAll(io, "Hello, Zyra!", 0);
+    }
+
+    const sf = StaticFiles.init(state.dir, "/static/");
+
+    // Full 200 response.
+    var req_full = http.HttpRequest{
+        .allocator = state.arena,
+        .method = .get,
+        .path = "/static/hello.txt",
+        .target = "/static/hello.txt",
+        .io = state.io,
+    };
+    const full = try sf.serve(&req_full);
+    state.full_status = full.status;
+    state.full_body = full.body;
+    state.full_etag = full.header("etag") orelse "";
+
+    // 304 Not Modified using the returned ETag.
+    var req_nm = http.HttpRequest{
+        .allocator = state.arena,
+        .method = .get,
+        .path = "/static/hello.txt",
+        .target = "/static/hello.txt",
+        .io = state.io,
+    };
+    try req_nm.addHeader("if-none-match", state.full_etag);
+    const nm = try sf.serve(&req_nm);
+    state.notmod_status = nm.status;
+
+    // 206 Partial Content via Range.
+    var req_rg = http.HttpRequest{
+        .allocator = state.arena,
+        .method = .get,
+        .path = "/static/hello.txt",
+        .target = "/static/hello.txt",
+        .io = state.io,
+    };
+    try req_rg.addHeader("range", "bytes=0-4");
+    const rg = try sf.serve(&req_rg);
+    state.range_status = rg.status;
+    state.range_body = rg.body;
+    state.range_content_range_present = rg.content_range_len > 0;
+
+    // 404 for a missing file.
+    var req_nf = http.HttpRequest{
+        .allocator = state.arena,
+        .method = .get,
+        .path = "/static/missing.txt",
+        .target = "/static/missing.txt",
+        .io = state.io,
+    };
+    const nf = try sf.serve(&req_nf);
+    state.notfound_status = nf.status;
+}
+
+fn smokeRoot(state: *SmokeState) anyerror!void {
+    const io = state.io;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, smokeRun, .{state});
+    group.await(io) catch {};
+}
+
+test "static files end-to-end serve 200 304 206 404" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var runtime = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+    const io = runtime.io();
+
+    var state = SmokeState{ .io = io, .dir = "zig-cache-zyra-static-smoke", .arena = arena };
+    try smokeRoot(&state);
+
+    if (state.err) |err| return err;
+
+    try std.testing.expectEqual(http.HttpStatus.ok, state.full_status);
+    try std.testing.expectEqualStrings("Hello, Zyra!", state.full_body);
+    try std.testing.expect(state.full_etag.len > 0);
+
+    try std.testing.expectEqual(http.HttpStatus.not_modified, state.notmod_status);
+
+    try std.testing.expectEqual(http.HttpStatus.partial_content, state.range_status);
+    try std.testing.expectEqualStrings("Hello", state.range_body);
+    try std.testing.expect(state.range_content_range_present);
+
+    try std.testing.expectEqual(http.HttpStatus.not_found, state.notfound_status);
+}

@@ -593,7 +593,7 @@ fn percentDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
 }
 
 
-fn stripQuery(target: []const u8) []const u8 {
+pub fn stripQuery(target: []const u8) []const u8 {
     return target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
 }
 

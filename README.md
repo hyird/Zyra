@@ -38,9 +38,14 @@ Implemented web-facing Hical-style API surface includes:
 - static files: `StaticFiles` serving with MIME types, ETag/`If-None-Match`
   (304), byte-range requests (206/416), and path-traversal protection
 - OpenAPI: `OpenApiDocument` builds an OpenAPI 3.0.3 JSON document from
-  registered operations (path params surfaced automatically)
+  registered operations (path params surfaced automatically). Call
+  `server.enableOpenApi(.{ .title = ... })` after registering routes to
+  auto-collect every route and serve the document at `/openapi.json`
 - WebSocket: RFC 6455 frame codec (`websocket.Frame` encode/decode with
-  masking) and handshake key derivation (`websocket.computeAcceptKey`)
+  masking) and handshake key derivation (`websocket.computeAcceptKey`).
+  Register a handler with `server.ws(path, handler)`; the server performs the
+  upgrade and runs the handler with a `WebSocketSession`
+  (`send`/`sendBinary`/`receive`/`close`)
 
 Not implemented yet: SSL/TLS and database/logging modules. Idle timeout,
 graceful shutdown, and GC interval APIs are intentionally not exposed until they

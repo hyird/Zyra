@@ -7,6 +7,8 @@ const http = @import("http.zig");
 const Router = @import("router.zig").Router;
 const MiddlewarePipeline = @import("middleware.zig").MiddlewarePipeline;
 const MemoryPool = @import("memory_pool.zig").MemoryPool;
+const websocket = @import("websocket.zig");
+const openapi = @import("openapi.zig");
 
 pub const ServerOptions = struct {
     host: []const u8 = "127.0.0.1",
@@ -27,6 +29,9 @@ pub const HttpServer = struct {
     middleware_: MiddlewarePipeline,
     memory_pool: MemoryPool,
     active_connections: std.atomic.Value(usize),
+    /// Pre-generated OpenAPI JSON document, served at `openapi_path` when set.
+    openapi_json: ?[]const u8 = null,
+    openapi_path: []const u8 = "/openapi.json",
 
     pub fn init(allocator: std.mem.Allocator, options: ServerOptions) HttpServer {
         return .{
@@ -40,6 +45,7 @@ pub const HttpServer = struct {
     }
 
     pub fn deinit(self: *HttpServer) void {
+        if (self.openapi_json) |json| self.allocator.free(json);
         self.middleware_.deinit();
         self.router_.deinit();
     }
@@ -62,6 +68,24 @@ pub const HttpServer = struct {
         after: ?@import("middleware.zig").AfterHandler,
     ) !void {
         try self.middleware_.useBeforeAfter(before, after);
+    }
+
+    /// Registers a WebSocket handler for an exact path. The server upgrades
+    /// matching requests and runs the handler with a `WebSocketSession`.
+    pub fn ws(self: *HttpServer, path: []const u8, handler: @import("router.zig").WsHandler) !void {
+        try self.router_.ws(path, handler);
+    }
+
+    /// Generates an OpenAPI 3.0.3 document from all currently registered routes
+    /// and serves it at `/openapi.json`. Call this after registering routes.
+    /// Replaces any previously generated document.
+    pub fn enableOpenApi(self: *HttpServer, config: openapi.Config) !void {
+        var doc = openapi.OpenApiDocument.init(self.allocator, config);
+        defer doc.deinit();
+        try doc.collectFromRouter(&self.router_);
+        const json = try doc.generate();
+        if (self.openapi_json) |old| self.allocator.free(old);
+        self.openapi_json = json;
     }
 
     pub fn setMaxBodySize(self: *HttpServer, bytes: usize) void {
@@ -165,12 +189,40 @@ pub const HttpServer = struct {
             };
             const keep_alive = raw_request.head.keep_alive;
 
+            // WebSocket upgrade: if the client requests an upgrade and a handler
+            // is registered for this path, take over the connection.
+            if (raw_request.upgradeRequested() == .websocket) {
+                const ws_path = http.stripQuery(raw_request.head.target);
+                if (self.router_.wsHandler(ws_path)) |handler| {
+                    try self.serveWebSocket(&raw_request, handler);
+                    return;
+                }
+            }
+
             var arena = self.memory_pool.requestArena();
             defer arena.deinit();
 
             var request = http.HttpRequest.initRaw(arena.allocator(), &raw_request) catch return;
             defer request.deinit();
             request.io = io;
+
+            // Serve the cached OpenAPI document, if enabled.
+            if (self.openapi_json) |json| {
+                if (request.method == .get and std.mem.eql(u8, request.path, self.openapi_path)) {
+                    var response = http.HttpResponse{
+                        .status = .ok,
+                        .body = json,
+                        .content_type = "application/json; charset=utf-8",
+                        .keep_alive = keep_alive,
+                    };
+                    response.respond(&raw_request) catch |err| switch (err) {
+                        error.WriteFailed => return cancelOrClose(writer.err),
+                        else => return,
+                    };
+                    if (!keep_alive) break;
+                    continue;
+                }
+            }
 
             if (request.content_length) |content_length| {
                 if (content_length > self.options.max_request_body_size) {
@@ -206,6 +258,29 @@ pub const HttpServer = struct {
 
             if (!keep_alive) break;
         }
+    }
+
+    /// Completes the WebSocket handshake and runs the registered handler.
+    fn serveWebSocket(
+        self: *HttpServer,
+        raw_request: *std.http.Server.Request,
+        handler: @import("router.zig").WsHandler,
+    ) Io.Cancelable!void {
+        _ = self;
+        const upgrade = raw_request.upgradeRequested();
+        const key = switch (upgrade) {
+            .websocket => |maybe_key| maybe_key orelse return,
+            else => return,
+        };
+
+        var socket = raw_request.respondWebSocket(.{ .key = key }) catch return;
+        socket.flush() catch return;
+
+        var session = websocket.WebSocketSession{ .ws = &socket };
+        handler(&session) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {},
+        };
     }
 };
 
@@ -275,4 +350,34 @@ test "HttpServer router and middleware registration" {
     };
     const response = try server.router().dispatch(&req);
     try std.testing.expectEqualStrings("ok", response.body);
+}
+
+test "enableOpenApi generates and caches a document" {
+    const handler = struct {
+        fn ok(_: *http.HttpRequest) !http.HttpResponse {
+            return http.HttpResponse.text("ok");
+        }
+    }.ok;
+
+    var server = HttpServer.init(std.testing.allocator, .{});
+    defer server.deinit();
+
+    try server.router().get("/users", handler);
+    try server.router().get("/users/{id}", handler);
+    try server.enableOpenApi(.{ .title = "Smoke API", .version = "9.9.9" });
+
+    try std.testing.expect(server.openapi_json != null);
+    const json = server.openapi_json.?;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("3.0.3", parsed.value.object.get("openapi").?.string);
+    try std.testing.expectEqualStrings("Smoke API", parsed.value.object.get("info").?.object.get("title").?.string);
+    try std.testing.expect(parsed.value.object.get("paths").?.object.get("/users") != null);
+
+    // Re-enabling replaces the cached document without leaking.
+    try server.enableOpenApi(.{ .title = "Replaced" });
+    const parsed2 = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, server.openapi_json.?, .{});
+    defer parsed2.deinit();
+    try std.testing.expectEqualStrings("Replaced", parsed2.value.object.get("info").?.object.get("title").?.string);
 }

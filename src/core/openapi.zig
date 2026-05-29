@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const http = @import("http.zig");
+const Router = @import("router.zig").Router;
 
 pub const Operation = struct {
     method: http.HttpMethod,
@@ -42,6 +43,17 @@ pub const OpenApiDocument = struct {
     /// Registers an operation. `summary` may be empty.
     pub fn addOperation(self: *OpenApiDocument, method: http.HttpMethod, path: []const u8, summary: []const u8) !void {
         try self.operations.append(self.allocator, .{ .method = method, .path = path, .summary = summary });
+    }
+
+    /// Collects every HTTP route registered on `router` as an operation
+    /// (without summaries). Path strings are borrowed from the router and must
+    /// outlive document generation.
+    pub fn collectFromRouter(self: *OpenApiDocument, router: *const Router) !void {
+        try router.forEachRoute(self, collectCallback);
+    }
+
+    fn collectCallback(self: *OpenApiDocument, method: http.HttpMethod, path: []const u8) anyerror!void {
+        try self.addOperation(method, path, "");
     }
 
     /// Generates the OpenAPI JSON document. The returned slice is owned by the
@@ -264,4 +276,40 @@ test "generate groups multiple methods under one path" {
     const items = parsed.value.object.get("paths").?.object.get("/items").?.object;
     try std.testing.expect(items.get("get") != null);
     try std.testing.expect(items.get("post") != null);
+}
+
+test "collectFromRouter gathers registered routes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const handler = struct {
+        fn h(_: *http.HttpRequest) anyerror!http.HttpResponse {
+            return http.HttpResponse.text("ok");
+        }
+    }.h;
+
+    var router = Router.init(alloc);
+    defer router.deinit();
+    try router.get("/users", handler);
+    try router.post("/users", handler);
+    try router.get("/users/{id}", handler);
+
+    var doc = OpenApiDocument.init(alloc, .{ .title = "From Router" });
+    defer doc.deinit();
+    try doc.collectFromRouter(&router);
+    try std.testing.expectEqual(@as(usize, 3), doc.operations.items.len);
+
+    const json = try doc.generate();
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+
+    const paths = parsed.value.object.get("paths").?.object;
+    const users = paths.get("/users").?.object;
+    try std.testing.expect(users.get("get") != null);
+    try std.testing.expect(users.get("post") != null);
+
+    const by_id = paths.get("/users/{id}").?.object.get("get").?.object;
+    const params = by_id.get("parameters").?.array;
+    try std.testing.expectEqualStrings("id", params.items[0].object.get("name").?.string);
 }

@@ -152,6 +152,84 @@ pub const Frame = struct {
     }
 };
 
+/// A received WebSocket message with its type.
+pub const Message = struct {
+    opcode: Opcode,
+    data: []const u8,
+};
+
+/// A live WebSocket connection.
+///
+/// This is a thin wrapper over the standard library's
+/// `std.http.Server.WebSocket`, which implements the RFC 6455 handshake and
+/// frame read/write. The server constructs a session after a successful
+/// upgrade and passes it to the registered handler.
+///
+/// Note: the underlying `readMessage` requires each message to fit in the
+/// server's read buffer and does not reassemble fragmented (`fin == false`)
+/// messages.
+pub const WebSocketSession = struct {
+    ws: *std.http.Server.WebSocket,
+    open: bool = true,
+
+    pub const ReceiveError = std.http.Server.WebSocket.ReadSmallTextMessageError;
+    pub const SendError = std.Io.Writer.Error;
+
+    /// Sends a UTF-8 text message.
+    pub fn send(self: *WebSocketSession, text: []const u8) SendError!void {
+        try self.ws.writeMessage(text, .text);
+    }
+
+    /// Sends a binary message.
+    pub fn sendBinary(self: *WebSocketSession, data: []const u8) SendError!void {
+        try self.ws.writeMessage(data, .binary);
+    }
+
+    /// Sends a ping frame with an optional payload (max 125 bytes).
+    pub fn sendPing(self: *WebSocketSession, payload: []const u8) SendError!void {
+        try self.ws.writeMessage(payload, .ping);
+    }
+
+    /// Receives the next message. Returns `null` when the peer closes the
+    /// connection. The returned data points into the connection read buffer and
+    /// is invalidated by the next `receive` call.
+    pub fn receive(self: *WebSocketSession) ReceiveError!?Message {
+        const msg = self.ws.readSmallMessage() catch |err| switch (err) {
+            error.ConnectionClose => {
+                self.open = false;
+                return null;
+            },
+            else => return err,
+        };
+        return .{ .opcode = stdToOpcode(msg.opcode), .data = msg.data };
+    }
+
+    /// Whether the connection is still considered open.
+    pub fn isOpen(self: *const WebSocketSession) bool {
+        return self.open;
+    }
+
+    /// Sends a close frame with the given code and marks the session closed.
+    pub fn close(self: *WebSocketSession, code: CloseCode) SendError!void {
+        var payload: [2]u8 = undefined;
+        std.mem.writeInt(u16, &payload, @intFromEnum(code), .big);
+        self.ws.writeMessage(&payload, .connection_close) catch {};
+        self.open = false;
+    }
+};
+
+fn stdToOpcode(op: std.http.Server.WebSocket.Opcode) Opcode {
+    return switch (op) {
+        .continuation => .continuation,
+        .text => .text,
+        .binary => .binary,
+        .connection_close => .close,
+        .ping => .ping,
+        .pong => .pong,
+        _ => .text,
+    };
+}
+
 test "computeAcceptKey matches RFC 6455 example" {
     // RFC 6455 §1.3 worked example.
     var out: [28]u8 = undefined;
@@ -228,4 +306,128 @@ test "encode/decode round trip" {
     const res = try Frame.decode(client.items, default_max_message_size);
     try std.testing.expectEqualStrings(original, res.frame.payload);
     try std.testing.expectEqual(client.items.len, res.consumed);
+}
+
+const zio = @import("zio");
+
+// End-to-end: a real WebSocket handshake + echo over a loopback connection
+// driven by the zio runtime, exercising WebSocketSession.receive/send.
+const E2eState = struct {
+    io: std.Io,
+    port: u16 = 0,
+    received: [64]u8 = undefined,
+    received_len: usize = 0,
+    ok: bool = false,
+};
+
+fn e2eServer(state: *E2eState, listener: *std.Io.net.Server) std.Io.Cancelable!void {
+    const io = state.io;
+    const stream = listener.accept(io) catch return;
+    defer stream.close(io);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = stream.reader(io, &rbuf);
+    var writer = stream.writer(io, &wbuf);
+    var server = std.http.Server.init(&reader.interface, &writer.interface);
+
+    var req = server.receiveHead() catch return;
+    const upgrade = req.upgradeRequested();
+    const key = switch (upgrade) {
+        .websocket => |k| k orelse return,
+        else => return,
+    };
+    var socket = req.respondWebSocket(.{ .key = key }) catch return;
+    socket.flush() catch return;
+
+    var session = WebSocketSession{ .ws = &socket };
+    const msg = (session.receive() catch return) orelse return;
+    // Echo it straight back.
+    session.send(msg.data) catch return;
+    socket.flush() catch {};
+}
+
+fn e2eClient(state: *E2eState) std.Io.Cancelable!void {
+    const io = state.io;
+
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", state.port) catch return;
+    const stream = addr.connect(io, .{ .mode = .stream }) catch return;
+    defer stream.close(io);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = stream.reader(io, &rbuf);
+    var writer = stream.writer(io, &wbuf);
+
+    // Minimal WebSocket client handshake.
+    const handshake =
+        "GET /chat HTTP/1.1\r\n" ++
+        "Host: 127.0.0.1\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    writer.interface.writeAll(handshake) catch return;
+    writer.interface.flush() catch return;
+
+    // Read until end of response headers (\r\n\r\n).
+    var header_buf: [1024]u8 = undefined;
+    var header_len: usize = 0;
+    while (header_len < header_buf.len) {
+        const n = reader.interface.readSliceShort(header_buf[header_len .. header_len + 1]) catch return;
+        if (n == 0) return;
+        header_len += 1;
+        if (header_len >= 4 and std.mem.eql(u8, header_buf[header_len - 4 .. header_len], "\r\n\r\n")) break;
+    }
+
+    // Send a masked text frame "ping".
+    const payload = "ping";
+    const mask = [4]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+    var frame: [10]u8 = undefined;
+    frame[0] = 0x81; // FIN + text
+    frame[1] = 0x80 | @as(u8, payload.len); // masked + len
+    @memcpy(frame[2..6], &mask);
+    for (payload, 0..) |c, i| frame[6 + i] = c ^ mask[i % 4];
+    writer.interface.writeAll(frame[0 .. 6 + payload.len]) catch return;
+    writer.interface.flush() catch return;
+
+    // Read the echoed (unmasked) server frame.
+    var resp: [64]u8 = undefined;
+    var resp_len: usize = 0;
+    while (resp_len < 6) {
+        const n = reader.interface.readSliceShort(resp[resp_len..]) catch return;
+        if (n == 0) break;
+        resp_len += n;
+    }
+    const decoded = Frame.decode(resp[0..resp_len], default_max_message_size) catch return;
+    @memcpy(state.received[0..decoded.frame.payload.len], decoded.frame.payload);
+    state.received_len = decoded.frame.payload.len;
+    state.ok = decoded.frame.opcode == .text;
+}
+
+fn e2eRoot(state: *E2eState, listener: *std.Io.net.Server) anyerror!void {
+    const io = state.io;
+    state.port = listener.socket.address.getPort();
+
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, e2eServer, .{ state, listener });
+    try group.concurrent(io, e2eClient, .{state});
+    group.await(io) catch {};
+}
+
+test "websocket end-to-end handshake and echo" {
+    var runtime = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+    const io = runtime.io();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+
+    var state = E2eState{ .io = io };
+    try e2eRoot(&state, &listener);
+
+    try std.testing.expect(state.ok);
+    try std.testing.expectEqualStrings("ping", state.received[0..state.received_len]);
 }

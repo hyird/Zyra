@@ -1,7 +1,12 @@
 const std = @import("std");
 const http = @import("http.zig");
+const websocket = @import("websocket.zig");
 
 pub const RouteHandler = *const fn (*http.HttpRequest) anyerror!http.HttpResponse;
+
+/// Handler for an upgraded WebSocket connection. Runs the receive/send loop and
+/// returns when the connection should be closed.
+pub const WsHandler = *const fn (*websocket.WebSocketSession) anyerror!void;
 
 const method_count = @typeInfo(http.HttpMethod).@"enum".fields.len;
 
@@ -16,6 +21,7 @@ pub const Router = struct {
     param_routes: [method_count]std.ArrayListUnmanaged(RouteEntry) = .{std.ArrayListUnmanaged(RouteEntry).empty} ** method_count,
     path_methods: std.StringHashMapUnmanaged(u16) = .{},
     owned_paths: std.ArrayListUnmanaged([]const u8) = .empty,
+    ws_routes: std.StringHashMapUnmanaged(WsHandler) = .{},
 
     pub fn init(allocator: std.mem.Allocator) Router {
         return .{ .allocator = allocator };
@@ -25,6 +31,7 @@ pub const Router = struct {
         for (&self.static_routes) |*routes| routes.deinit(self.allocator);
         for (&self.param_routes) |*routes| routes.deinit(self.allocator);
         self.path_methods.deinit(self.allocator);
+        self.ws_routes.deinit(self.allocator);
         for (self.owned_paths.items) |path| self.allocator.free(path);
         self.owned_paths.deinit(self.allocator);
     }
@@ -72,6 +79,41 @@ pub const Router = struct {
 
     pub fn options(self: *Router, path: []const u8, handler: RouteHandler) !void {
         try self.route(.options, path, handler);
+    }
+
+    /// Registers a WebSocket handler for an exact path. The connection is
+    /// upgraded automatically when a client sends a WebSocket upgrade request
+    /// for this path.
+    pub fn ws(self: *Router, path: []const u8, handler: WsHandler) !void {
+        try self.ws_routes.put(self.allocator, path, handler);
+    }
+
+    /// Looks up the WebSocket handler registered for an exact path, if any.
+    pub fn wsHandler(self: *const Router, path: []const u8) ?WsHandler {
+        return self.ws_routes.get(path);
+    }
+
+    /// Calls `callback(ctx, method, path)` for every registered HTTP route
+    /// (static and parameterized), in no particular order. Used for
+    /// introspection such as OpenAPI document generation.
+    pub fn forEachRoute(
+        self: *const Router,
+        ctx: anytype,
+        comptime callback: fn (@TypeOf(ctx), http.HttpMethod, []const u8) anyerror!void,
+    ) anyerror!void {
+        for (self.static_routes, 0..) |routes, index| {
+            const method: http.HttpMethod = @enumFromInt(index);
+            var it = routes.iterator();
+            while (it.next()) |entry| {
+                try callback(ctx, method, entry.key_ptr.*);
+            }
+        }
+        for (self.param_routes, 0..) |routes, index| {
+            const method: http.HttpMethod = @enumFromInt(index);
+            for (routes.items) |entry| {
+                try callback(ctx, method, entry.path);
+            }
+        }
     }
 
     pub fn routeCount(self: *const Router) usize {
@@ -424,4 +466,20 @@ test "route group path joining handles slash edge cases" {
 
     var req3: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/admin/panel/", .target = "/admin/panel/" };
     try std.testing.expectEqualStrings("panel", (try router.dispatch(&req3)).body);
+}
+
+test "ws handler registration and lookup" {
+    const handler = struct {
+        fn run(_: *websocket.WebSocketSession) anyerror!void {}
+    }.run;
+
+    var router = Router.init(std.testing.allocator);
+    defer router.deinit();
+
+    try std.testing.expect(router.wsHandler("/chat") == null);
+    try router.ws("/chat", handler);
+    try std.testing.expect(router.wsHandler("/chat") != null);
+    try std.testing.expect(router.wsHandler("/other") == null);
+    // ws routes are independent of HTTP route count.
+    try std.testing.expectEqual(@as(usize, 0), router.routeCount());
 }
