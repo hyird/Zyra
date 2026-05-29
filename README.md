@@ -24,11 +24,11 @@ Implemented web-facing Hical-style API surface includes:
 - route methods: `get`, `post`, `put`, `patch`, `delete`/`del`, `head`, `options`
 - `Router.group()` / `RouteGroup` prefix routing
 - request helpers: `header`, `query`, `queryParam`, `queryParams`, `cookie`,
-  `cookies`, `formParam`, `formParams`, `body`, `contentType`, path params,
-  and string attributes
+  `cookies`, `formParam`, `formParams`, `body`, `contentType`, `readJson`,
+  `jsonResponse`, path params, and string attributes
 - response helpers: `statusCode`, `setStatus`, `header`, `setHeader`,
-  `setBody`, `bodyText`, `badRequest`, `redirect`, `setCookie`, and 416 range
-  error factory
+  `setBody`, `bodyText`, `jsonValue`, `setJsonBody`, `badRequest`, `redirect`,
+  `setCookie`, and 416 range error factory
 - server limit setters for body/header size and max connections
 
 Not implemented yet: WebSocket, SSL/TLS, OpenAPI, static files, multipart, and

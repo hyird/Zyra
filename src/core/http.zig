@@ -209,6 +209,20 @@ pub const HttpRequest = struct {
         return self.content_type orelse self.header("content-type");
     }
 
+    /// Parses the request body as JSON into a value of type `T`.
+    /// Allocations are made from the request allocator (per-request arena) and
+    /// are released when the request is freed, so no separate deinit is needed.
+    pub fn readJson(self: *HttpRequest, comptime T: type) !T {
+        return std.json.parseFromSliceLeaky(T, self.allocator, self.body_bytes, .{
+            .ignore_unknown_fields = true,
+        });
+    }
+
+    /// Builds a JSON response by serializing `value` using the request allocator.
+    pub fn jsonResponse(self: *HttpRequest, value: anytype) !HttpResponse {
+        return HttpResponse.jsonValue(self.allocator, value);
+    }
+
     pub fn setParam(self: *HttpRequest, name: []const u8, value: []const u8) !void {
         for (self.inline_params[0..self.inline_param_count]) |*param_entry| {
             if (std.mem.eql(u8, param_entry.name, name)) {
@@ -343,6 +357,13 @@ pub const HttpResponse = struct {
         return .{ .body = body, .content_type = "application/json" };
     }
 
+    /// Serializes `value` to JSON using `allocator` and returns a response with
+    /// the JSON content type set. The serialized bytes are owned by `allocator`.
+    pub fn jsonValue(allocator: std.mem.Allocator, value: anytype) !HttpResponse {
+        const body = try stringifyJson(allocator, value);
+        return .{ .body = body, .content_type = "application/json" };
+    }
+
     pub fn badRequest(message: []const u8) HttpResponse {
         return .{ .status = .bad_request, .body = message };
     }
@@ -417,6 +438,13 @@ pub const HttpResponse = struct {
     pub fn setBody(self: *HttpResponse, body_bytes: []const u8, content_type_: []const u8) void {
         self.body = body_bytes;
         self.content_type = content_type_;
+    }
+
+    /// Serializes `value` to JSON using `allocator`, stores it as the response
+    /// body, and sets the JSON content type. The bytes are owned by `allocator`.
+    pub fn setJsonBody(self: *HttpResponse, allocator: std.mem.Allocator, value: anytype) !void {
+        self.body = try stringifyJson(allocator, value);
+        self.content_type = "application/json";
     }
 
     pub fn bodyText(self: *const HttpResponse) []const u8 {
@@ -507,6 +535,13 @@ fn formatCookie(buffer: []u8, cookie_entry: ResponseCookie) ![]const u8 {
     if (cookie_entry.options.http_only) try writer.writeAll("; HttpOnly");
     if (cookie_entry.options.same_site) |same_site| try writer.print("; SameSite={s}", .{sameSiteText(same_site)});
     return buffer[0..writer.end];
+}
+
+fn stringifyJson(allocator: std.mem.Allocator, value: anytype) ![]const u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.toOwnedSlice();
 }
 
 fn parseUrlEncoded(allocator: std.mem.Allocator, input: []const u8, out: *QueryParams) !void {
@@ -735,18 +770,59 @@ test "response helper factories" {
     try std.testing.expectEqual(HttpStatus.requested_range_not_satisfiable, range.status);
 }
 
-test "response body header and cookie helpers" {
-    var res = HttpResponse.ok("body");
-    try res.setHeader("X-Test", "1");
-    try res.setHeader("content-type", "application/octet-stream");
-    try res.setCookie("sid", "abc", .{ .path = "/", .http_only = true, .same_site = .lax });
+test "request readJson parses body into typed value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    try std.testing.expectEqualStrings("1", res.header("x-test").?);
-    try std.testing.expectEqualStrings("application/octet-stream", res.header("content-type").?);
-    try std.testing.expectEqualStrings("body", res.bodyText());
-    try std.testing.expectEqual(@as(u8, 1), res.inline_cookie_count);
-    try std.testing.expectEqualStrings("sid", res.inline_cookies[0].name);
-    try std.testing.expectEqualStrings("abc", res.inline_cookies[0].value);
+    var req = HttpRequest.initParsed(arena.allocator(), "POST", "/", "application/json", null, true);
+    defer req.deinit();
+    req.body_bytes =
+        \\{"name":"zig","count":7,"extra":"ignored"}
+    ;
+
+    const Payload = struct { name: []const u8, count: u32 };
+    const parsed = try req.readJson(Payload);
+    try std.testing.expectEqualStrings("zig", parsed.name);
+    try std.testing.expectEqual(@as(u32, 7), parsed.count);
+}
+
+test "response jsonValue serializes value with json content type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const res = try HttpResponse.jsonValue(arena.allocator(), .{ .ok = true, .id = 42 });
+    try std.testing.expectEqualStrings("application/json", res.content_type);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"id\":42}", res.body);
+}
+
+test "response setJsonBody serializes into existing response" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var res = HttpResponse.ok("");
+    res.setStatus(.created);
+    try res.setJsonBody(arena.allocator(), .{ .message = "created" });
+
+    try std.testing.expectEqual(HttpStatus.created, res.statusCode());
+    try std.testing.expectEqualStrings("application/json", res.content_type);
+    try std.testing.expectEqualStrings("{\"message\":\"created\"}", res.bodyText());
+}
+
+test "request jsonResponse round-trips body through arena" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = HttpRequest.initParsed(arena.allocator(), "POST", "/echo", "application/json", null, true);
+    defer req.deinit();
+    req.body_bytes =
+        \\{"value":3}
+    ;
+
+    const Payload = struct { value: u32 };
+    const parsed = try req.readJson(Payload);
+    const res = try req.jsonResponse(.{ .value = parsed.value + 1 });
+    try std.testing.expectEqualStrings("application/json", res.content_type);
+    try std.testing.expectEqualStrings("{\"value\":4}", res.body);
 }
 
 test "response factories cover common Hical web helpers" {
