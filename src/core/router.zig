@@ -75,6 +75,7 @@ pub const Router = struct {
     root_routes: [method_count]?RouteEndpoint = .{null} ** method_count,
     static_routes: [method_count]std.StringHashMapUnmanaged(RouteEndpoint) = .{std.StringHashMapUnmanaged(RouteEndpoint).empty} ** method_count,
     param_routes: [method_count]std.ArrayListUnmanaged(RouteEntry) = .{std.ArrayListUnmanaged(RouteEntry).empty} ** method_count,
+    param_route_count: usize = 0,
     path_methods: std.StringHashMapUnmanaged(u16) = .{},
     owned_paths: std.ArrayListUnmanaged([]const u8) = .empty,
     /// 拥有由 `RouteGroup` 创建的合并后组中间件链，在 `deinit` 中释放。
@@ -107,6 +108,7 @@ pub const Router = struct {
         const index = methodIndex(method);
         if (isParamPath(path)) {
             try self.param_routes[index].append(self.allocator, .{ .path = path, .endpoint = endpoint });
+            self.param_route_count += 1;
         } else {
             if (isRootPath(path)) self.root_routes[index] = endpoint;
             try self.static_routes[index].put(self.allocator, path, endpoint);
@@ -203,9 +205,7 @@ pub const Router = struct {
 
         if (isRootPath(req.path)) {
             if (self.root_routes[index]) |endpoint| return endpoint.invoke(req);
-        }
-
-        if (self.static_routes[index].get(req.path)) |endpoint| {
+        } else if (self.static_routes[index].get(req.path)) |endpoint| {
             return endpoint.invoke(req);
         }
 
@@ -225,9 +225,11 @@ pub const Router = struct {
     fn allowedMethods(self: *const Router, req: *const http.HttpRequest) ?[]const u8 {
         var bits: u16 = self.path_methods.get(req.path) orelse 0;
 
-        for (self.param_routes, 0..) |routes, index| {
-            for (routes.items) |entry| {
-                if (pathShapeMatches(entry.path, req.path)) bits |= @as(u16, 1) << @intCast(index);
+        if (self.param_route_count != 0) {
+            for (self.param_routes, 0..) |routes, index| {
+                for (routes.items) |entry| {
+                    if (pathShapeMatches(entry.path, req.path)) bits |= @as(u16, 1) << @intCast(index);
+                }
             }
         }
 
