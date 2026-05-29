@@ -257,6 +257,29 @@ pub const HttpRequest = struct {
         return self.param(name) != null;
     }
 
+    pub const ParamError = error{ MissingParam, InvalidParam };
+
+    /// 取路径参数并解析为整数类型 T（对齐 Hical req.param + zono input.int）。
+    /// 缺失返回 error.MissingParam，无法解析返回 error.InvalidParam。
+    pub fn paramInt(self: *const HttpRequest, comptime T: type, name: []const u8) ParamError!T {
+        const raw = self.param(name) orelse return error.MissingParam;
+        return std.fmt.parseInt(T, raw, 10) catch error.InvalidParam;
+    }
+
+    /// 取路径参数并解析为浮点类型 T。
+    pub fn paramFloat(self: *const HttpRequest, comptime T: type, name: []const u8) ParamError!T {
+        const raw = self.param(name) orelse return error.MissingParam;
+        return std.fmt.parseFloat(T, raw) catch error.InvalidParam;
+    }
+
+    /// 取路径参数并解析为布尔值（接受 true/false/1/0）。
+    pub fn paramBool(self: *const HttpRequest, name: []const u8) ParamError!bool {
+        const raw = self.param(name) orelse return error.MissingParam;
+        if (std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "1")) return true;
+        if (std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "0")) return false;
+        return error.InvalidParam;
+    }
+
     pub fn queryParam(self: *HttpRequest, name: []const u8) !?[]const u8 {
         const params = try self.queryParams();
         return params.get(name);
@@ -717,6 +740,30 @@ test "request headers params and rollback" {
     req.rollbackParams(checkpoint);
     try std.testing.expect(req.param("two") == null);
     try std.testing.expect(req.hasParam("one"));
+}
+
+test "request typed path param accessors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = HttpRequest.initParsed(arena.allocator(), "GET", "/users/42", null, null, true);
+    defer req.deinit();
+
+    try req.setParam("id", "42");
+    try req.setParam("ratio", "1.5");
+    try req.setParam("active", "true");
+    try req.setParam("enabled", "0");
+    try req.setParam("bad", "nope");
+
+    try std.testing.expectEqual(@as(u64, 42), try req.paramInt(u64, "id"));
+    try std.testing.expectEqual(@as(f64, 1.5), try req.paramFloat(f64, "ratio"));
+    try std.testing.expectEqual(true, try req.paramBool("active"));
+    try std.testing.expectEqual(false, try req.paramBool("enabled"));
+
+    try std.testing.expectError(error.MissingParam, req.paramInt(u64, "missing"));
+    try std.testing.expectError(error.InvalidParam, req.paramInt(u64, "bad"));
+    try std.testing.expectError(error.InvalidParam, req.paramFloat(f64, "bad"));
+    try std.testing.expectError(error.InvalidParam, req.paramBool("bad"));
 }
 
 test "request helpers parse form body" {

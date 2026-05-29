@@ -25,7 +25,8 @@ Implemented web-facing Hical-style API surface includes:
 - `Router.group()` / `RouteGroup` prefix routing
 - request helpers: `header`, `query`, `queryParam`, `queryParams`, `cookie`,
   `cookies`, `formParam`, `formParams`, `body`, `contentType`, `readJson`,
-  `jsonResponse`, path params, and string attributes
+  `jsonResponse`, path params (string via `param`; typed via `paramInt`,
+  `paramFloat`, `paramBool`), and string attributes
 - response helpers: `statusCode`, `setStatus`, `header`, `setHeader`,
   `setBody`, `bodyText`, `jsonValue`, `setJsonBody`, `badRequest`, `redirect`,
   `setCookie`, and 416 range error factory
