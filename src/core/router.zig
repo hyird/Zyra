@@ -237,7 +237,25 @@ fn methodBit(method: http.HttpMethod) u16 {
 }
 
 fn isParamPath(path: []const u8) bool {
-    return std.mem.indexOfScalar(u8, path, '{') != null;
+    return std.mem.indexOfScalar(u8, path, '{') != null or
+        std.mem.indexOfScalar(u8, path, '*') != null;
+}
+
+/// True for a trailing catch-all segment: `*`, `*name`, or `{*name}`.
+/// A catch-all captures the entire remainder of the request path (including any
+/// embedded slashes) and must be the last segment of the pattern.
+fn isWildcardSegment(segment: []const u8) bool {
+    if (segment.len == 0) return false;
+    if (segment[0] == '*') return true; // `*` or `*name`
+    if (isParamSegment(segment) and segment[1] == '*') return true; // `{*name}`
+    return false;
+}
+
+/// Returns the capture name for a wildcard segment (may be empty for a bare
+/// `*`). Assumes `isWildcardSegment(segment)` is true.
+fn wildcardName(segment: []const u8) []const u8 {
+    if (segment[0] == '*') return segment[1..]; // `*name` -> `name`, `*` -> ``
+    return segment[2 .. segment.len - 1]; // `{*name}` -> `name`
 }
 
 fn matchParamPath(pattern_raw: []const u8, path_raw: []const u8, req: *http.HttpRequest) !bool {
@@ -245,7 +263,18 @@ fn matchParamPath(pattern_raw: []const u8, path_raw: []const u8, req: *http.Http
     var path = trimLeadingSlash(path_raw);
 
     while (pattern.len > 0 or path.len > 0) {
+        const remainder = path;
         const p_seg = nextSegment(&pattern);
+        if (p_seg) |p| {
+            if (isWildcardSegment(p)) {
+                // Catch-all: bind the entire remaining path and finish. The
+                // wildcard must be the final pattern segment.
+                if (pattern.len != 0) return false;
+                const name = wildcardName(p);
+                if (name.len > 0) try req.setParam(name, remainder);
+                return true;
+            }
+        }
         const r_seg = nextSegment(&path);
         if (p_seg == null or r_seg == null) return false;
 
@@ -266,6 +295,9 @@ fn pathShapeMatches(pattern_raw: []const u8, path_raw: []const u8) bool {
 
     while (pattern.len > 0 or path.len > 0) {
         const p_seg = nextSegment(&pattern);
+        if (p_seg) |p| {
+            if (isWildcardSegment(p)) return pattern.len == 0;
+        }
         const r_seg = nextSegment(&path);
         if (p_seg == null or r_seg == null) return false;
         const p = p_seg.?;
@@ -482,4 +514,58 @@ test "ws handler registration and lookup" {
     try std.testing.expect(router.wsHandler("/other") == null);
     // ws routes are independent of HTTP route count.
     try std.testing.expectEqual(@as(usize, 0), router.routeCount());
+}
+
+test "named catch-all wildcard captures the remaining path" {
+    var router = Router.init(std.testing.allocator);
+    defer router.deinit();
+
+    try router.get("/files/{*path}", struct {
+        fn handler(req: *http.HttpRequest) !http.HttpResponse {
+            return http.HttpResponse.text(req.param("path").?);
+        }
+    }.handler);
+
+    var req: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/files/a/b/c.txt", .target = "/files/a/b/c.txt" };
+    const res = try router.dispatch(&req);
+    try std.testing.expectEqual(http.HttpStatus.ok, res.status);
+    try std.testing.expectEqualStrings("a/b/c.txt", res.body);
+}
+
+test "star-prefixed and bare wildcard segments" {
+    var router = Router.init(std.testing.allocator);
+    defer router.deinit();
+
+    try router.get("/assets/*rest", struct {
+        fn handler(req: *http.HttpRequest) !http.HttpResponse {
+            return http.HttpResponse.text(req.param("rest").?);
+        }
+    }.handler);
+    try router.get("/catch/*", textHandler("caught"));
+
+    var req1: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/assets/css/app.css", .target = "/assets/css/app.css" };
+    try std.testing.expectEqualStrings("css/app.css", (try router.dispatch(&req1)).body);
+
+    // Bare wildcard matches but captures nothing.
+    var req2: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/catch/anything/here", .target = "/catch/anything/here" };
+    try std.testing.expectEqualStrings("caught", (try router.dispatch(&req2)).body);
+}
+
+test "wildcard combines with leading fixed and param segments" {
+    var router = Router.init(std.testing.allocator);
+    defer router.deinit();
+
+    try router.get("/u/{id}/files/{*path}", struct {
+        fn handler(req: *http.HttpRequest) !http.HttpResponse {
+            try std.testing.expectEqualStrings("7", req.param("id").?);
+            return http.HttpResponse.text(req.param("path").?);
+        }
+    }.handler);
+
+    var req: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/u/7/files/deep/nested.bin", .target = "/u/7/files/deep/nested.bin" };
+    try std.testing.expectEqualStrings("deep/nested.bin", (try router.dispatch(&req)).body);
+
+    // Non-matching prefix still 404s.
+    var req_nf: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/u/7/other/x", .target = "/u/7/other/x" };
+    try std.testing.expectEqual(http.HttpStatus.not_found, (try router.dispatch(&req_nf)).status);
 }

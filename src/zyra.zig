@@ -11,6 +11,9 @@ pub const Header = http.Header;
 pub const HttpRequest = http.HttpRequest;
 pub const HttpResponse = http.HttpResponse;
 
+pub const header_map = @import("core/header_map.zig");
+pub const HeaderMap = header_map.HeaderMap;
+
 pub const Router = @import("core/router.zig").Router;
 pub const RouteGroup = @import("core/router.zig").RouteGroup;
 pub const MiddlewarePipeline = @import("core/middleware.zig").MiddlewarePipeline;
@@ -56,4 +59,5 @@ test {
     _ = session;
     _ = ws_hub;
     _ = log;
+    _ = header_map;
 }

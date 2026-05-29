@@ -67,6 +67,59 @@ pub fn writerSink(writer: *std.Io.Writer) Sink {
     return .{ .ptr = writer, .writeFn = Adapter.write };
 }
 
+/// A `Sink` that appends log lines to a file using the `std.Io` file API.
+///
+/// Each line is written with a trailing newline at the current end offset, so
+/// concurrent loggers writing to distinct `FileSink`s never interleave within a
+/// line. The file is created (and, by default, truncated) on `open`; pass
+/// `.{ .truncate = false }` to keep and append after any existing content.
+///
+/// `FileSink` owns the underlying `std.Io.File` and must be closed with
+/// `close`. It must outlive any `Logger` built from its `sink()`.
+pub const FileSink = struct {
+    io: std.Io,
+    file: std.Io.File,
+    offset: u64,
+
+    pub const OpenOptions = struct {
+        /// Truncate an existing file to zero length on open. When false, the
+        /// sink appends after the current contents.
+        truncate: bool = true,
+    };
+
+    /// Creates or opens `path` for appending log lines. `path` is resolved
+    /// relative to the current working directory via `std.Io.Dir.cwd()`.
+    pub fn open(io: std.Io, path: []const u8, options: OpenOptions) !FileSink {
+        var dir = std.Io.Dir.cwd();
+        const file = try dir.createFile(io, path, .{ .truncate = options.truncate });
+        var offset: u64 = 0;
+        if (!options.truncate) {
+            const st = file.stat(io) catch |e| {
+                file.close(io);
+                return e;
+            };
+            offset = st.size;
+        }
+        return .{ .io = io, .file = file, .offset = offset };
+    }
+
+    pub fn close(self: *FileSink) void {
+        self.file.close(self.io);
+    }
+
+    fn write(ptr: *anyopaque, line: []const u8) anyerror!void {
+        const self: *FileSink = @ptrCast(@alignCast(ptr));
+        try self.file.writePositionalAll(self.io, line, self.offset);
+        self.offset += line.len;
+        try self.file.writePositionalAll(self.io, "\n", self.offset);
+        self.offset += 1;
+    }
+
+    pub fn sink(self: *FileSink) Sink {
+        return .{ .ptr = self, .writeFn = write };
+    }
+};
+
 pub const Logger = struct {
     sink: Sink,
     min_level: Level = .info,
@@ -284,4 +337,70 @@ fn okHandler(_: *http.HttpRequest) anyerror!http.HttpResponse {
 
 fn errorHandler(_: *http.HttpRequest) anyerror!http.HttpResponse {
     return http.HttpResponse.serverError();
+}
+
+const zio = @import("zio");
+
+const FileSinkState = struct {
+    io: std.Io,
+    path: []const u8,
+    err: ?anyerror = null,
+};
+
+fn fileSinkImpl(state: *FileSinkState) anyerror!void {
+    const io = state.io;
+    var dir = std.Io.Dir.cwd();
+    dir.deleteFile(io, state.path) catch {};
+    defer dir.deleteFile(io, state.path) catch {};
+
+    {
+        var fs = try FileSink.open(io, state.path, .{});
+        defer fs.close();
+        const logger = Logger.init(fs.sink(), .info);
+        logger.info("first", &.{.{ .key = "n", .value = "1" }});
+        logger.debug("skipped", &.{}); // below min level
+        logger.warn("second", &.{});
+    }
+
+    // Re-open in append mode and add one more line.
+    {
+        var fs = try FileSink.open(io, state.path, .{ .truncate = false });
+        defer fs.close();
+        const logger = Logger.init(fs.sink(), .info);
+        logger.err("third", &.{});
+    }
+
+    var file = try dir.openFile(io, state.path, .{});
+    defer file.close(io);
+    var buf: [256]u8 = undefined;
+    const n = try file.readPositionalAll(io, &buf, 0);
+    const contents = buf[0..n];
+    try std.testing.expectEqualStrings(
+        "INFO first n=1\nWARN second\nERROR third\n",
+        contents,
+    );
+}
+
+fn fileSinkRoot(state: *FileSinkState) anyerror!void {
+    const io = state.io;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    const Wrapper = struct {
+        fn run(s: *FileSinkState) std.Io.Cancelable!void {
+            fileSinkImpl(s) catch |e| {
+                s.err = e;
+            };
+        }
+    };
+    try group.concurrent(io, Wrapper.run, .{state});
+    group.await(io) catch {};
+    if (state.err) |e| return e;
+}
+
+test "FileSink appends structured lines and supports append mode" {
+    var runtime = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+
+    var state = FileSinkState{ .io = runtime.io(), .path = "zig-cache-zyra-log-filesink-test.log" };
+    try fileSinkRoot(&state);
 }

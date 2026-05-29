@@ -60,10 +60,21 @@ Implemented web-facing Hical-style API surface includes:
    `Sink`, with `add`/`remove`/`join`/`leave`/`broadcast`/`broadcastBinary`/
    `broadcastAll`/`sendTo`/`roomSize`/`connectionCount`. All methods take
    `io: std.Io` and synchronize with `std.Io.Mutex`
- - logging: structured `Logger` (`Level`/`Field`/`Sink`, `writerSink`) plus a
-   `LogMiddleware` context-onion that logs method/path/status and request
-   duration (sourced from `req.io` via `std.Io.Clock`)
+  - logging: structured `Logger` (`Level`/`Field`/`Sink`, `writerSink`) plus a
+    `LogMiddleware` context-onion that logs method/path/status and request
+    duration (sourced from `req.io` via `std.Io.Clock`). `FileSink` writes log
+    lines to a file via `std.Io.File` positional writes (truncate by default,
+    or append with `.{ .truncate = false }`)
+  - header container: `HeaderMap`, an allocator-backed, case-insensitive
+    multi-value header store (`set`/`insert`/`erase`/`find`/`findAll`/
+    `contains`/`count`/`reserve`/`clear`); borrows name/value slices
+  - routing: path params (`:name`/`{name}`) and wildcard catch-all (`*`,
+    `*name`, `{*name}`) which binds the entire trailing path segment(s) to a
+    capture; the wildcard must be the last segment
+  - idle timeout: `ServerOptions.idle_timeout_ms` bounds the wait for the next
+    request on a kept-alive connection (0 disables). Implemented via zio's
+    recv+timer completion racing inside the event loop, so it fires correctly
+    under epoll/io_uring readiness models with no extra coroutine
 
-Not implemented yet: SSL/TLS and database modules. Idle timeout,
-graceful shutdown, and GC interval APIs are intentionally not exposed until they
-are fully implemented.
+Not implemented yet: SSL/TLS and database modules. Graceful shutdown and GC
+interval APIs are intentionally not exposed until they are fully implemented.
