@@ -474,11 +474,13 @@ pub const HttpResponse = struct {
     }
 
     pub fn methodNotAllowed(allow: []const u8) HttpResponse {
-        return .{
+        var response = HttpResponse{
             .status = .method_not_allowed,
             .body = "Method Not Allowed",
-            .extra_headers = &.{.{ .name = "allow", .value = allow }},
         };
+        response.inline_headers[0] = .{ .name = "allow", .value = allow };
+        response.inline_header_count = 1;
+        return response;
     }
 
     pub fn serverError() HttpResponse {
@@ -763,7 +765,6 @@ fn percentDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     }
     return decoded[0..out];
 }
-
 
 /// 该方法的请求按 HTTP 语义是否可能携带请求体。镜像 std 的
 /// `std.http.Method.requestHasBody`，用于决定 `initRaw` 是否必须复制

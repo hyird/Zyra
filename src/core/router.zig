@@ -158,6 +158,10 @@ pub const Router = struct {
         return self.ws_routes.get(path);
     }
 
+    pub fn hasWebSocketRoutes(self: *const Router) bool {
+        return self.ws_routes.count() != 0;
+    }
+
     /// 对每条已注册的 HTTP 路由（静态和带参数的）调用
     /// `callback(ctx, method, path)`，顺序不定。用于内省，例如生成 OpenAPI
     /// 文档。

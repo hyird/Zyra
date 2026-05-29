@@ -245,7 +245,7 @@ pub const HttpServer = struct {
 
         // 并发运行 accept 循环，使调用方 fiber 可以等待关闭信号。当该信号
         // 到来时取消 accept 循环，从而在其下一个取消点中断阻塞的 `accept`。
-    var accept_future = io.async(HttpServer.acceptLoop, .{ self, io, &listener, &group });
+        var accept_future = io.async(HttpServer.acceptLoop, .{ self, io, &listener, &group });
 
         // 阻塞直到请求优雅关闭（若从不请求则一直阻塞）。
         self.shutdown_event.waitUncancelable(io);
@@ -302,7 +302,6 @@ pub const HttpServer = struct {
             };
         }
     }
-
 
     fn tryAcquireConnection(self: *HttpServer) bool {
         if (self.options.max_connections == 0) {
@@ -398,7 +397,7 @@ pub const HttpServer = struct {
 
             // WebSocket 升级：若客户端请求升级，且本路径注册了处理函数，
             // 则接管该连接。
-            if (raw_request.upgradeRequested() == .websocket) {
+            if (self.router_.hasWebSocketRoutes() and raw_request.upgradeRequested() == .websocket) {
                 const ws_path = http.stripQuery(raw_request.head.target);
                 if (self.router_.wsHandler(ws_path)) |handler| {
                     try self.serveWebSocket(&raw_request, handler);
