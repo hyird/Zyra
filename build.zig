@@ -8,6 +8,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const httpx_dep = b.dependency("httpx", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     const zyra_mod = b.addModule("zyra", .{
         .root_source_file = b.path("src/zyra.zig"),
@@ -15,6 +19,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     zyra_mod.addImport("zio", zio_dep.module("zio"));
+    zyra_mod.addImport("httpx", httpx_dep.module("httpx"));
 
     // 所有示例程序：每个对应一个可执行文件和一个 `run-<名字>` 步骤，
     // 其中 basic 额外绑定到默认的 `run` 步骤。
@@ -43,6 +48,7 @@ pub fn build(b: *std.Build) void {
         });
         exe.root_module.addImport("zyra", zyra_mod);
         exe.root_module.addImport("zio", zio_dep.module("zio"));
+        exe.root_module.addImport("httpx", httpx_dep.module("httpx"));
         b.installArtifact(exe);
 
         const run_exe = b.addRunArtifact(exe);
@@ -59,6 +65,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.addImport("zio", zio_dep.module("zio"));
+    tests.root_module.addImport("httpx", httpx_dep.module("httpx"));
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);

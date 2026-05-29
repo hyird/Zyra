@@ -156,45 +156,69 @@ pub const Message = struct {
 
 /// 一个存活的 WebSocket 连接。
 ///
-/// 这是标准库 `std.http.Server.WebSocket` 之上的一层薄包装；后者实现了
-/// RFC 6455 握手和帧读写。服务器在升级成功后构造一个 session，并传给已注册
-/// 的处理器。
-///
-/// 注意：底层 `readMessage` 要求每条消息都能放入服务器读缓冲区，并且不会重组
-/// 分片（`fin == false`）消息。
+/// 这是 Zyra 自己基于 `std.Io.Reader`/`std.Io.Writer` 的轻量 WebSocket
+/// 会话包装。服务器完成 HTTP upgrade 握手后构造 session，并传给已注册处理器。
+/// 当前实现面向小消息：单帧消息会被读入内部缓冲，不重组分片消息。
 pub const WebSocketSession = struct {
-    ws: *std.http.Server.WebSocket,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    read_buf: [64 * 1024]u8 = undefined,
     open: bool = true,
 
-    pub const ReceiveError = std.http.Server.WebSocket.ReadSmallTextMessageError;
+    pub const ReceiveError = anyerror;
     pub const SendError = std.Io.Writer.Error;
 
     /// 发送 UTF-8 文本消息。
     pub fn send(self: *WebSocketSession, text: []const u8) SendError!void {
-        try self.ws.writeMessage(text, .text);
+        try self.writeFrame(.text, text);
     }
 
     /// 发送二进制消息。
     pub fn sendBinary(self: *WebSocketSession, data: []const u8) SendError!void {
-        try self.ws.writeMessage(data, .binary);
+        try self.writeFrame(.binary, data);
     }
 
     /// 发送带可选负载的 ping 帧（最多 125 字节）。
     pub fn sendPing(self: *WebSocketSession, payload: []const u8) SendError!void {
-        try self.ws.writeMessage(payload, .ping);
+        try self.writeFrame(.ping, payload);
     }
 
     /// 接收下一条消息。当对端关闭连接时返回 `null`。返回的数据指向连接读缓冲区，
     /// 会在下一次 `receive` 调用时失效。
     pub fn receive(self: *WebSocketSession) ReceiveError!?Message {
-        const msg = self.ws.readSmallMessage() catch |err| switch (err) {
-            error.ConnectionClose => {
-                self.open = false;
-                return null;
-            },
-            else => return err,
-        };
-        return .{ .opcode = stdToOpcode(msg.opcode), .data = msg.data };
+        var header: [2]u8 = undefined;
+        try readExact(self.reader, &header);
+
+        const b0 = header[0];
+        const b1 = header[1];
+        var payload_len: u64 = b1 & 0x7f;
+        var ext: [8]u8 = undefined;
+        if (payload_len == 126) {
+            try readExact(self.reader, ext[0..2]);
+            payload_len = std.mem.readInt(u16, ext[0..2], .big);
+        } else if (payload_len == 127) {
+            try readExact(self.reader, &ext);
+            payload_len = std.mem.readInt(u64, &ext, .big);
+        }
+
+        const masked = (b1 & 0x80) != 0;
+        var mask: [4]u8 = .{ 0, 0, 0, 0 };
+        if (masked) try readExact(self.reader, &mask);
+
+        if (payload_len > self.read_buf.len) return error.MessageTooLarge;
+        const len: usize = @intCast(payload_len);
+        try readExact(self.reader, self.read_buf[0..len]);
+        const payload = self.read_buf[0..len];
+        if (masked) {
+            for (payload, 0..) |*byte, i| byte.* ^= mask[i % 4];
+        }
+
+        const opcode: Opcode = @enumFromInt(@as(u4, @truncate(b0 & 0x0f)));
+        if (opcode == .close) {
+            self.open = false;
+            return null;
+        }
+        return .{ .opcode = opcode, .data = payload };
     }
 
     /// 连接是否仍被认为处于打开状态。
@@ -206,21 +230,38 @@ pub const WebSocketSession = struct {
     pub fn close(self: *WebSocketSession, code: CloseCode) SendError!void {
         var payload: [2]u8 = undefined;
         std.mem.writeInt(u16, &payload, @intFromEnum(code), .big);
-        self.ws.writeMessage(&payload, .connection_close) catch {};
+        self.writeFrame(.close, &payload) catch {};
         self.open = false;
+    }
+
+    fn writeFrame(self: *WebSocketSession, opcode: Opcode, payload: []const u8) SendError!void {
+        var header: [10]u8 = undefined;
+        header[0] = 0x80 | @as(u8, @intFromEnum(opcode));
+        const header_len: usize = if (payload.len < 126) blk: {
+            header[1] = @intCast(payload.len);
+            break :blk 2;
+        } else if (payload.len <= 0xffff) blk: {
+            header[1] = 126;
+            std.mem.writeInt(u16, header[2..4], @intCast(payload.len), .big);
+            break :blk 4;
+        } else blk: {
+            header[1] = 127;
+            std.mem.writeInt(u64, header[2..10], @intCast(payload.len), .big);
+            break :blk 10;
+        };
+        try self.writer.writeAll(header[0..header_len]);
+        try self.writer.writeAll(payload);
+        try self.writer.flush();
     }
 };
 
-fn stdToOpcode(op: std.http.Server.WebSocket.Opcode) Opcode {
-    return switch (op) {
-        .continuation => .continuation,
-        .text => .text,
-        .binary => .binary,
-        .connection_close => .close,
-        .ping => .ping,
-        .pong => .pong,
-        _ => .text,
-    };
+fn readExact(reader: *std.Io.Reader, buf: []u8) anyerror!void {
+    var done: usize = 0;
+    while (done < buf.len) {
+        const n = try reader.readSliceShort(buf[done..]);
+        if (n == 0) return error.ConnectionClosed;
+        done += n;
+    }
 }
 
 test "computeAcceptKey matches RFC 6455 example" {
@@ -322,22 +363,32 @@ fn e2eServer(state: *E2eState, listener: *std.Io.net.Server) std.Io.Cancelable!v
     var wbuf: [4096]u8 = undefined;
     var reader = stream.reader(io, &rbuf);
     var writer = stream.writer(io, &wbuf);
-    var server = std.http.Server.init(&reader.interface, &writer.interface);
 
-    var req = server.receiveHead() catch return;
-    const upgrade = req.upgradeRequested();
-    const key = switch (upgrade) {
-        .websocket => |k| k orelse return,
-        else => return,
-    };
-    var socket = req.respondWebSocket(.{ .key = key }) catch return;
-    socket.flush() catch return;
+    var header_buf: [1024]u8 = undefined;
+    var header_len: usize = 0;
+    while (header_len < header_buf.len) {
+        const n = reader.interface.readSliceShort(header_buf[header_len .. header_len + 1]) catch return;
+        if (n == 0) return;
+        header_len += n;
+        if (header_len >= 4 and std.mem.eql(u8, header_buf[header_len - 4 .. header_len], "\r\n\r\n")) break;
+    }
+    const key_name = "Sec-WebSocket-Key:";
+    const key_start = std.ascii.indexOfIgnoreCase(header_buf[0..header_len], key_name) orelse return;
+    var key_line = header_buf[key_start + key_name.len ..];
+    const key_end = std.mem.indexOf(u8, key_line, "\r\n") orelse return;
+    const key = std.mem.trim(u8, key_line[0..key_end], " \t");
+    var accept_buf: [28]u8 = undefined;
+    const accept = computeAcceptKey(key, &accept_buf);
+    writer.interface.writeAll("HTTP/1.1 101 Switching Protocols\r\n") catch return;
+    writer.interface.writeAll("Upgrade: websocket\r\n") catch return;
+    writer.interface.writeAll("Connection: Upgrade\r\n") catch return;
+    writer.interface.print("Sec-WebSocket-Accept: {s}\r\n\r\n", .{accept}) catch return;
+    writer.interface.flush() catch return;
 
-    var session = WebSocketSession{ .ws = &socket };
+    var session = WebSocketSession{ .reader = &reader.interface, .writer = &writer.interface };
     const msg = (session.receive() catch return) orelse return;
     // 原样回显。
     session.send(msg.data) catch return;
-    socket.flush() catch {};
 }
 
 fn e2eClient(state: *E2eState) std.Io.Cancelable!void {

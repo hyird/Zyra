@@ -8,6 +8,10 @@
             .url = "git+https://github.com/lalinsky/zio.git#db1a7072bd020fa6da92176f2ef3780a7e6a1c93",
             .hash = "zio-0.12.1-xHbVVJbZHABrWrZfVMiSrtP6Y0EfrgecpCvA-Bbezqfj",
         },
+        .httpx = .{
+            .url = "git+https://github.com/muhammad-fiaz/httpx.zig.git?ref=zig-0.16#e1ddbe63ebb3288a9726695f6c4e23e1f31e5f13",
+            .hash = "httpx-0.1.0-8qj2eniTCwCVvUDlN8aZyFlGKrLxX3ZJuTdiyS3LRP8J",
+        },
     },
     .paths = .{
         "build.zig",

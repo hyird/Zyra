@@ -1,6 +1,10 @@
 const std = @import("std");
+const httpx = @import("httpx");
 
-pub const Header = std.http.Header;
+pub const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
 
 pub const HttpMethod = enum {
     get,
@@ -23,7 +27,7 @@ pub const HttpMethod = enum {
         return .unknown;
     }
 
-    pub fn fromStd(method: std.http.Method) HttpMethod {
+    pub fn fromHttpx(method: httpx.Method) HttpMethod {
         return switch (method) {
             .GET => .get,
             .POST => .post,
@@ -63,8 +67,37 @@ pub const HttpStatus = enum(u10) {
     bad_gateway = 502,
     service_unavailable = 503,
 
-    pub fn toStd(self: HttpStatus) std.http.Status {
-        return @enumFromInt(@intFromEnum(self));
+    pub fn code(self: HttpStatus) u16 {
+        return @intFromEnum(self);
+    }
+
+    pub fn reason(self: HttpStatus) []const u8 {
+        return switch (self) {
+            .ok => "OK",
+            .created => "Created",
+            .accepted => "Accepted",
+            .no_content => "No Content",
+            .partial_content => "Partial Content",
+            .moved_permanently => "Moved Permanently",
+            .found => "Found",
+            .not_modified => "Not Modified",
+            .temporary_redirect => "Temporary Redirect",
+            .permanent_redirect => "Permanent Redirect",
+            .bad_request => "Bad Request",
+            .unauthorized => "Unauthorized",
+            .forbidden => "Forbidden",
+            .not_found => "Not Found",
+            .method_not_allowed => "Method Not Allowed",
+            .conflict => "Conflict",
+            .payload_too_large => "Payload Too Large",
+            .requested_range_not_satisfiable => "Range Not Satisfiable",
+            .too_many_requests => "Too Many Requests",
+            .request_header_fields_too_large => "Request Header Fields Too Large",
+            .internal_server_error => "Internal Server Error",
+            .not_implemented => "Not Implemented",
+            .bad_gateway => "Bad Gateway",
+            .service_unavailable => "Service Unavailable",
+        };
     }
 };
 
@@ -143,81 +176,23 @@ pub const HttpRequest = struct {
         };
     }
 
-    pub fn init(allocator: std.mem.Allocator, head: std.http.Server.Request.Head) HttpRequest {
-        const path = stripQuery(head.target);
-        return .{
-            .allocator = allocator,
-            .method = .fromStd(head.method),
-            .path = path,
-            .target = head.target,
-            .content_type = head.content_type,
-            .content_length = head.content_length,
-            .keep_alive = head.keep_alive,
-        };
-    }
-
-    /// 从原始 `std.http.Server.Request` 构造一个请求。
-    ///
-    /// 零拷贝优化分两档，取决于请求是否带请求体：
-    ///
-    /// - **无 body 请求**（无 content-length 或为 0，且非 chunked 传输）：
-    ///   处理期间不会消费输入流，因此 reader 的 `head_buffer` 在整个请求
-    ///   生命周期（直到 `respond` 写出、请求 `deinit`）内保持有效。此时
-    ///   **完全不复制**，target/content_type/header 切片直接借用 reader
-    ///   缓冲——每请求 **零分配**。下一次 `receiveHead` 才会覆盖该缓冲，
-    ///   而那时请求早已 deinit。
-    /// - **有 body 请求**：请求体读取（`readAlloc`/`fillMore`）会 rebase 并
-    ///   覆盖 `head_buffer`，使借用的 header 切片悬垂。因此把整段
-    ///   `head_buffer` 一次性复制进请求 arena（单次分配），并把每个借用
-    ///   切片重定位到这份独立副本上。
-    ///
-    /// 两种情况都把 “每个 header 各做一次 dupe” 的 `2N+2` 次分配，降为
-    /// 0（无 body）或 1（有 body）次。
-    pub fn initRaw(allocator: std.mem.Allocator, raw: *const std.http.Server.Request) !HttpRequest {
-        const original = raw.head_buffer;
-
-        // 是否会在请求处理期间消费输入流（从而使 head_buffer 失效）。有两条
-        // 独立的消费路径，任一成立都必须复制 head_buffer：
-        //   1. 服务器读取请求体（`handleClient` 在 content_length>0 或 chunked
-        //      时调用 readAlloc）。
-        //   2. `std.http.Server` 在 `respond` 内调用 `discardBody` 丢弃未读
-        //      请求体——它只在 `method.requestHasBody()`（POST/PUT/PATCH）时
-        //      才消费输入流，哪怕 content_length 为 0。
-        // 因此判定 = 任意带体方法，或存在非空/分块请求体。其余（GET/HEAD/
-        // DELETE/OPTIONS 且无体）全程不碰输入流，可纯借用、零分配。
-        const has_body = methodHasBody(raw.head.method) or
-            raw.head.transfer_encoding == .chunked or
-            (raw.head.content_length orelse 0) > 0;
-
-        // 无 body：借用原缓冲，恒等重定位，零分配。
-        // 有 body：复制一份独立副本，切片重定位到副本。
-        const head: []const u8 = if (has_body) try allocator.dupe(u8, original) else original;
-
-        // 把一个借用自 `original` 的切片重定位到 `head` 的同一偏移上。
-        // 任何切片都满足 `original.ptr <= s.ptr <= original.ptr + original.len`，
-        // 因为它们都解析自 head_buffer。`head == original` 时这是恒等映射。
-        const Reloc = struct {
-            fn slice(orig: []const u8, dst: []const u8, s: []const u8) []const u8 {
-                const offset = @intFromPtr(s.ptr) - @intFromPtr(orig.ptr);
-                return dst[offset..][0..s.len];
-            }
-        };
-
-        const target = Reloc.slice(original, head, raw.head.target);
+    /// 从 httpx 的增量解析器构造请求。解析器拥有 path/header 切片；由于它会在
+    /// 请求处理前 deinit，这里把目标和头部复制到请求 arena。
+    pub fn initHttpx(allocator: std.mem.Allocator, parser: *const httpx.Parser, keep_alive: bool) !HttpRequest {
+        const target = try allocator.dupe(u8, parser.path orelse "/");
         var request = HttpRequest{
             .allocator = allocator,
-            .method = .fromStd(raw.head.method),
+            .method = .fromHttpx(parser.method orelse .GET),
             .path = stripQuery(target),
             .target = target,
-            .content_type = if (raw.head.content_type) |ct| Reloc.slice(original, head, ct) else null,
-            .content_length = raw.head.content_length,
-            .keep_alive = raw.head.keep_alive,
+            .content_length = parser.content_length,
+            .keep_alive = keep_alive,
         };
-        var iter = raw.iterateHeaders();
-        while (iter.next()) |entry| {
-            const name = Reloc.slice(original, head, entry.name);
-            const value = Reloc.slice(original, head, entry.value);
+        for (parser.headers.entries.items) |entry| {
+            const name = try allocator.dupe(u8, entry.name);
+            const value = try allocator.dupe(u8, entry.value);
             try request.addHeader(name, value);
+            if (std.ascii.eqlIgnoreCase(name, "content-type")) request.content_type = value;
         }
         return request;
     }
@@ -577,60 +552,91 @@ pub const HttpResponse = struct {
         self.inline_cookie_count += 1;
     }
 
-    pub fn respond(self: HttpResponse, raw: *std.http.Server.Request) !void {
-        if (self.hasSimpleHeaders()) {
-            var headers: [1]Header = .{.{ .name = "content-type", .value = self.content_type }};
-            try raw.respond(self.body, .{
-                .status = self.status.toStd(),
-                .keep_alive = self.keep_alive,
-                .extra_headers = &headers,
-            });
-            return;
-        }
+    /// 写出 HTTP/1.1 响应。若设置了 `file`，则响应体以分块方式从磁盘流式发送
+    /// （常量内存）而非缓冲。需要 `io`。
+    pub fn respondWithIo(self: HttpResponse, allocator: std.mem.Allocator, writer: *std.Io.Writer, io: std.Io, request_method: HttpMethod) !void {
+        if (self.file == null) return self.respondWithHttpx(allocator, writer);
 
-        var headers_buf: [24]Header = undefined;
-        var cookie_values: [max_inline_cookies][256]u8 = undefined;
-        const headers = self.buildHeaders(&headers_buf, &cookie_values);
-        try raw.respond(self.body, .{
-            .status = self.status.toStd(),
-            .keep_alive = self.keep_alive,
-            .extra_headers = headers,
-        });
-    }
+        const content_length: u64 = if (self.file) |fb| fb.length else self.body.len;
+        try self.writeHead(writer, content_length);
+        if (request_method == .head) return;
 
-    /// 同 `respond`，但若设置了 `file`，则响应体以分块方式从磁盘流式发送
-    /// （常量内存）而非缓冲。需要 `io`。没有文件体时回退到 `respond`。
-    pub fn respondWithIo(self: HttpResponse, raw: *std.http.Server.Request, io: std.Io) !void {
-        const fb = self.file orelse return self.respond(raw);
+        if (self.file) |fb| {
+            if (fb.length == 0) return;
+            var dir = std.Io.Dir.cwd();
+            var file = dir.openFile(io, fb.path, .{}) catch return error.FileOpenFailed;
+            defer file.close(io);
 
-        var headers_buf: [24]Header = undefined;
-        var cookie_values: [max_inline_cookies][256]u8 = undefined;
-        const headers = self.buildHeaders(&headers_buf, &cookie_values);
-
-        var dir = std.Io.Dir.cwd();
-        var file = dir.openFile(io, fb.path, .{}) catch return error.FileOpenFailed;
-        defer file.close(io);
-
-        // 以等于范围长度的显式 content-length 流式发送响应体。
-        var send_buf: [64 * 1024]u8 = undefined;
-        var body_writer = try raw.respondStreaming(&send_buf, .{
-            .content_length = fb.length,
-            .respond_options = .{
-                .status = self.status.toStd(),
-                .keep_alive = self.keep_alive,
-                .extra_headers = headers,
-            },
-        });
-
-        // HEAD 请求省略响应体；完全跳过文件读取工作。
-        if (!body_writer.isEliding() and fb.length > 0) {
             var read_buf: [64 * 1024]u8 = undefined;
             var reader = file.reader(io, &read_buf);
             reader.seekTo(fb.offset) catch return error.FileReadFailed;
-            reader.interface.streamExact64(&body_writer.writer, fb.length) catch
-                return error.FileReadFailed;
+            reader.interface.streamExact64(writer, fb.length) catch return error.FileReadFailed;
+            return;
         }
-        try body_writer.end();
+
+        if (self.body.len > 0) try writer.writeAll(self.body);
+    }
+
+    fn respondWithHttpx(self: HttpResponse, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
+        var response = httpx.Response.init(allocator, self.status.code());
+        defer response.deinit();
+        response.body = self.body;
+
+        try response.headers.set("content-type", self.content_type);
+        var len_buf: [32]u8 = undefined;
+        const content_len = std.fmt.bufPrint(&len_buf, "{d}", .{self.body.len}) catch unreachable;
+        try response.headers.set("content-length", content_len);
+        if (!self.keep_alive) try response.headers.set("connection", "close");
+
+        for (self.inline_headers[0..self.inline_header_count]) |response_header| {
+            if (std.ascii.eqlIgnoreCase(response_header.name, "content-length")) continue;
+            if (std.ascii.eqlIgnoreCase(response_header.name, "content-type")) continue;
+            try response.headers.append(response_header.name, response_header.value);
+        }
+        for (self.extra_headers) |extra_header| {
+            if (std.ascii.eqlIgnoreCase(extra_header.name, "content-length")) continue;
+            if (std.ascii.eqlIgnoreCase(extra_header.name, "content-type")) continue;
+            try response.headers.append(extra_header.name, extra_header.value);
+        }
+        if (self.content_range_len > 0) {
+            try response.headers.set("content-range", self.content_range_buffer[0..self.content_range_len]);
+        }
+        var cookie_values: [max_inline_cookies][256]u8 = undefined;
+        for (self.inline_cookies[0..self.inline_cookie_count], 0..) |cookie_entry, index| {
+            const value = formatCookie(&cookie_values[index], cookie_entry) catch unreachable;
+            try response.headers.append("set-cookie", value);
+        }
+
+        const formatted = try httpx.formatResponse(&response, allocator);
+        defer allocator.free(formatted);
+        try writer.writeAll(formatted);
+    }
+
+    fn writeHead(self: HttpResponse, writer: *std.Io.Writer, content_length: u64) !void {
+        try writer.print("HTTP/1.1 {d} {s}\r\n", .{ self.status.code(), self.status.reason() });
+        try writer.print("content-type: {s}\r\n", .{self.content_type});
+        try writer.print("content-length: {d}\r\n", .{content_length});
+        if (!self.keep_alive) try writer.writeAll("connection: close\r\n");
+
+        for (self.inline_headers[0..self.inline_header_count]) |response_header| {
+            if (std.ascii.eqlIgnoreCase(response_header.name, "content-length")) continue;
+            if (std.ascii.eqlIgnoreCase(response_header.name, "content-type")) continue;
+            try writer.print("{s}: {s}\r\n", .{ response_header.name, response_header.value });
+        }
+        for (self.extra_headers) |extra_header| {
+            if (std.ascii.eqlIgnoreCase(extra_header.name, "content-length")) continue;
+            if (std.ascii.eqlIgnoreCase(extra_header.name, "content-type")) continue;
+            try writer.print("{s}: {s}\r\n", .{ extra_header.name, extra_header.value });
+        }
+        if (self.content_range_len > 0) {
+            try writer.print("content-range: {s}\r\n", .{self.content_range_buffer[0..self.content_range_len]});
+        }
+        var cookie_values: [max_inline_cookies][256]u8 = undefined;
+        for (self.inline_cookies[0..self.inline_cookie_count], 0..) |cookie_entry, index| {
+            const value = formatCookie(&cookie_values[index], cookie_entry) catch unreachable;
+            try writer.print("set-cookie: {s}\r\n", .{value});
+        }
+        try writer.writeAll("\r\n");
     }
 
     /// 把响应头部列表（内容类型、内联/额外头部、content-range、set-cookie）
@@ -764,18 +770,6 @@ fn percentDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     return decoded[0..out];
 }
 
-
-/// 该方法的请求按 HTTP 语义是否可能携带请求体。镜像 std 的
-/// `std.http.Method.requestHasBody`，用于决定 `initRaw` 是否必须复制
-/// head_buffer（因为 `std.http.Server.respond` 会对带体方法丢弃未读体，
-/// 从而消费输入流并使借用的 head 切片失效）。
-fn methodHasBody(m: std.http.Method) bool {
-    return switch (m) {
-        .POST, .PUT, .PATCH => true,
-        else => false,
-    };
-}
-
 pub fn stripQuery(target: []const u8) []const u8 {
     return target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
 }
@@ -822,15 +816,14 @@ test "http method conversions" {
     try std.testing.expectEqual(HttpMethod.get, HttpMethod.fromBytes("GET"));
     try std.testing.expectEqual(HttpMethod.post, HttpMethod.fromBytes("POST"));
     try std.testing.expectEqual(HttpMethod.unknown, HttpMethod.fromBytes("BREW"));
-
-    try std.testing.expectEqual(HttpMethod.delete, HttpMethod.fromStd(.DELETE));
+    try std.testing.expectEqual(HttpMethod.delete, HttpMethod.fromHttpx(.DELETE));
 }
 
-test "http status converts to std status" {
-    try std.testing.expectEqual(std.http.Status.ok, HttpStatus.ok.toStd());
-    try std.testing.expectEqual(std.http.Status.not_found, HttpStatus.not_found.toStd());
-    try std.testing.expectEqual(std.http.Status.method_not_allowed, HttpStatus.method_not_allowed.toStd());
-    try std.testing.expectEqual(std.http.Status.internal_server_error, HttpStatus.internal_server_error.toStd());
+test "http status exposes wire code and reason" {
+    try std.testing.expectEqual(@as(u16, 200), HttpStatus.ok.code());
+    try std.testing.expectEqual(@as(u16, 404), HttpStatus.not_found.code());
+    try std.testing.expectEqualStrings("Method Not Allowed", HttpStatus.method_not_allowed.reason());
+    try std.testing.expectEqualStrings("Internal Server Error", HttpStatus.internal_server_error.reason());
 }
 
 test "request init helpers and basic accessors" {
@@ -845,22 +838,14 @@ test "request init helpers and basic accessors" {
     try std.testing.expectEqualStrings("", parsed.body());
     try std.testing.expectEqual(false, parsed.keep_alive);
 
-    const head = std.http.Server.Request.Head{
-        .method = .POST,
-        .target = "/submit?x=1",
-        .version = .@"HTTP/1.1",
-        .expect = null,
-        .content_type = "text/plain",
-        .content_length = 4,
-        .transfer_encoding = .none,
-        .transfer_compression = .identity,
-        .keep_alive = true,
-    };
-    var request_from_head = HttpRequest.init(arena.allocator(), head);
-    defer request_from_head.deinit();
-    try std.testing.expectEqual(HttpMethod.post, request_from_head.method);
-    try std.testing.expectEqualStrings("/submit", request_from_head.path);
-    try std.testing.expectEqualStrings("text/plain", request_from_head.contentType().?);
+    var parser = httpx.Parser.init(arena.allocator());
+    defer parser.deinit();
+    _ = try parser.feed("POST /submit?x=1 HTTP/1.1\r\ncontent-type: text/plain\r\ncontent-length: 4\r\n\r\n");
+    var request_from_parser = try HttpRequest.initHttpx(arena.allocator(), &parser, true);
+    defer request_from_parser.deinit();
+    try std.testing.expectEqual(HttpMethod.post, request_from_parser.method);
+    try std.testing.expectEqualStrings("/submit", request_from_parser.path);
+    try std.testing.expectEqualStrings("text/plain", request_from_parser.contentType().?);
 }
 
 test "request headers params and rollback" {
