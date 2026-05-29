@@ -106,6 +106,7 @@ pub const HttpRequest = struct {
     method: HttpMethod,
     path: []const u8,
     target: []const u8,
+    query_string: []const u8 = "",
     content_type: ?[]const u8 = null,
     content_length: ?u64 = null,
     keep_alive: bool = true,
@@ -132,11 +133,13 @@ pub const HttpRequest = struct {
         content_length: ?u64,
         keep_alive: bool,
     ) HttpRequest {
+        const target_parts = splitTarget(target);
         return .{
             .allocator = allocator,
             .method = .fromBytes(method),
-            .path = stripQuery(target),
+            .path = target_parts.path,
             .target = target,
+            .query_string = target_parts.query,
             .content_type = content_type,
             .content_length = content_length,
             .keep_alive = keep_alive,
@@ -144,12 +147,13 @@ pub const HttpRequest = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, head: std.http.Server.Request.Head) HttpRequest {
-        const path = stripQuery(head.target);
+        const target_parts = splitTarget(head.target);
         return .{
             .allocator = allocator,
             .method = .fromStd(head.method),
-            .path = path,
+            .path = target_parts.path,
             .target = head.target,
+            .query_string = target_parts.query,
             .content_type = head.content_type,
             .content_length = head.content_length,
             .keep_alive = head.keep_alive,
@@ -204,11 +208,13 @@ pub const HttpRequest = struct {
         };
 
         const target = Reloc.slice(original, head, raw.head.target);
+        const target_parts = splitTarget(target);
         var request = HttpRequest{
             .allocator = allocator,
             .method = .fromStd(raw.head.method),
-            .path = stripQuery(target),
+            .path = target_parts.path,
             .target = target,
+            .query_string = target_parts.query,
             .content_type = if (raw.head.content_type) |ct| Reloc.slice(original, head, ct) else null,
             .content_length = raw.head.content_length,
             .keep_alive = raw.head.keep_alive,
@@ -249,8 +255,7 @@ pub const HttpRequest = struct {
     }
 
     pub fn query(self: *const HttpRequest) []const u8 {
-        const question = std.mem.indexOfScalar(u8, self.target, '?') orelse return "";
-        return self.target[question + 1 ..];
+        return self.query_string;
     }
 
     pub fn body(self: *const HttpRequest) []const u8 {
@@ -778,7 +783,13 @@ fn methodHasBody(m: std.http.Method) bool {
 }
 
 pub fn stripQuery(target: []const u8) []const u8 {
-    return target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+    return splitTarget(target).path;
+}
+
+fn splitTarget(target: []const u8) struct { path: []const u8, query: []const u8 } {
+    const question = std.mem.indexOfScalar(u8, target, '?') orelse
+        return .{ .path = target, .query = "" };
+    return .{ .path = target[0..question], .query = target[question + 1 ..] };
 }
 
 test "request path strips query" {

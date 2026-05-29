@@ -34,6 +34,8 @@ pub const RouteEndpoint = struct {
     /// 围绕处理函数运行组中间件链（before 钩子按顺序，after 钩子逆序）。
     /// 短路的 before 钩子仍会运行已进入的那些组的 after 钩子。
     pub fn invoke(self: RouteEndpoint, req: *http.HttpRequest) anyerror!http.HttpResponse {
+        if (self.middleware.len == 0) return self.handler(req);
+
         var entered: usize = 0;
         for (self.middleware) |mw| {
             entered += 1;

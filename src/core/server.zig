@@ -384,6 +384,8 @@ pub const HttpServer = struct {
         // 完成的竞争（无额外协程），这是在 epoll/io_uring 就绪模型下唯一
         // 真正会触发的超时机制。
         const idle_timeout = self.idleTimeout();
+        const has_middleware = self.middleware_.size() != 0;
+        const has_websocket_routes = self.router_.hasWebSocketRoutes();
 
         while (true) {
             reader.setTimeout(idle_timeout);
@@ -397,7 +399,7 @@ pub const HttpServer = struct {
 
             // WebSocket 升级：若客户端请求升级，且本路径注册了处理函数，
             // 则接管该连接。
-            if (self.router_.hasWebSocketRoutes() and raw_request.upgradeRequested() == .websocket) {
+            if (has_websocket_routes and raw_request.upgradeRequested() == .websocket) {
                 const ws_path = http.stripQuery(raw_request.head.target);
                 if (self.router_.wsHandler(ws_path)) |handler| {
                     try self.serveWebSocket(&raw_request, handler);
@@ -455,7 +457,10 @@ pub const HttpServer = struct {
                 }
             }
 
-            var response = self.middleware_.execute(&self.router_, &request) catch |err| self.handleError(&request, err);
+            var response = if (has_middleware)
+                self.middleware_.execute(&self.router_, &request) catch |err| self.handleError(&request, err)
+            else
+                self.router_.dispatch(&request) catch |err| self.handleError(&request, err);
             response.keep_alive = keep_alive;
             response.respondWithIo(&raw_request, io) catch |err| switch (err) {
                 error.WriteFailed => return cancelOrClose(writer.err),
