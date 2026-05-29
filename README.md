@@ -46,6 +46,16 @@ Implemented web-facing Hical-style API surface includes:
   body). The reflector (`schema.writeSchema`) maps bool/int/float/string,
   optionals (`nullable`), slices/arrays, enums (`string` + `enum`), and nested
   structs (`object` + `properties`/`required`)
+- typed routes: register handlers shaped as `fn(*HttpRequest, Body) E!Response`
+  (or `fn(*HttpRequest) E!Response`) via `server.postJson`/`getJson`/`putJson`/
+  `patchJson`/`deleteJson` (or `routeJson(method, ...)`). A compile-time
+  trampoline parses the JSON body into `Body` (responding `400` on malformed
+  JSON), invokes the handler, and serializes the returned value as a JSON
+  response (`void` yields an empty `200`). The reflected `Body`/`Response` types
+  feed OpenAPI schemas automatically when `enableOpenApi` is called. The
+  trampoline is a concrete `fn(*HttpRequest) anyerror!HttpResponse`, so there is
+  no runtime dispatch overhead beyond the body parse/serialize a hand-written
+  handler would already do
  - WebSocket: RFC 6455 frame codec (`websocket.Frame` encode/decode with
    masking) and handshake key derivation (`websocket.computeAcceptKey`).
    Register a handler with `server.ws(path, handler)`; the server performs the

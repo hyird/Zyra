@@ -9,6 +9,18 @@ const MiddlewarePipeline = @import("middleware.zig").MiddlewarePipeline;
 const MemoryPool = @import("memory_pool.zig").MemoryPool;
 const websocket = @import("websocket.zig");
 const openapi = @import("openapi.zig");
+const typed_route = @import("typed_route.zig");
+
+/// Records a typed route's OpenAPI metadata. `register` is a compile-time
+/// generated function that adds the route's reflected request/response schemas
+/// to a document; the `Request`/`Response` types are captured inside it, so no
+/// runtime type information needs to be stored.
+const TypedRouteRecord = struct {
+    method: http.HttpMethod,
+    path: []const u8,
+    summary: []const u8,
+    register: *const fn (*openapi.OpenApiDocument, http.HttpMethod, []const u8, []const u8) anyerror!void,
+};
 
 /// zio's `ExecutorCount` type, recovered from `Runtime.init`'s options
 /// parameter since the root `zio` module does not re-export it directly.
@@ -44,6 +56,10 @@ pub const HttpServer = struct {
     /// Pre-generated OpenAPI JSON document, served at `openapi_path` when set.
     openapi_json: ?[]const u8 = null,
     openapi_path: []const u8 = "/openapi.json",
+    /// OpenAPI metadata for routes registered through the typed JSON helpers
+    /// (`getJson`/`postJson`/...). Used by `enableOpenApi` to emit reflected
+    /// request/response schemas.
+    typed_routes: std.ArrayListUnmanaged(TypedRouteRecord) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, options: ServerOptions) HttpServer {
         return .{
@@ -58,6 +74,7 @@ pub const HttpServer = struct {
 
     pub fn deinit(self: *HttpServer) void {
         if (self.openapi_json) |json| self.allocator.free(json);
+        self.typed_routes.deinit(self.allocator);
         self.middleware_.deinit();
         self.router_.deinit();
     }
@@ -98,12 +115,77 @@ pub const HttpServer = struct {
         try self.router_.ws(path, handler);
     }
 
+    /// Options for the typed JSON route helpers.
+    pub const JsonRouteOptions = struct {
+        summary: []const u8 = "",
+    };
+
+    /// Registers a typed JSON route. `handler` is a function of the form
+    /// `fn(*HttpRequest, Body) E!Response` or `fn(*HttpRequest) E!Response`,
+    /// where `Body`/`Response` are Zig types. The framework parses the JSON body
+    /// into `Body` (responding 400 on malformed JSON), invokes the handler, and
+    /// serializes the returned value as a JSON response (`void` yields an empty
+    /// 200). The request/response types are reflected into OpenAPI schemas when
+    /// `enableOpenApi` is called.
+    pub fn routeJson(
+        self: *HttpServer,
+        method: http.HttpMethod,
+        path: []const u8,
+        comptime handler: anytype,
+        options: JsonRouteOptions,
+    ) !void {
+        try self.router_.route(method, path, typed_route.wrap(handler));
+        const ti = comptime typed_route.infoOf(handler);
+        const register = struct {
+            fn reg(
+                doc: *openapi.OpenApiDocument,
+                m: http.HttpMethod,
+                p: []const u8,
+                summary: []const u8,
+            ) anyerror!void {
+                try doc.addJsonOperation(ti.Body, ti.Response, m, p, .{ .summary = summary });
+            }
+        }.reg;
+        try self.typed_routes.append(self.allocator, .{
+            .method = method,
+            .path = path,
+            .summary = options.summary,
+            .register = register,
+        });
+    }
+
+    pub fn getJson(self: *HttpServer, path: []const u8, comptime handler: anytype, options: JsonRouteOptions) !void {
+        try self.routeJson(.get, path, handler, options);
+    }
+
+    pub fn postJson(self: *HttpServer, path: []const u8, comptime handler: anytype, options: JsonRouteOptions) !void {
+        try self.routeJson(.post, path, handler, options);
+    }
+
+    pub fn putJson(self: *HttpServer, path: []const u8, comptime handler: anytype, options: JsonRouteOptions) !void {
+        try self.routeJson(.put, path, handler, options);
+    }
+
+    pub fn patchJson(self: *HttpServer, path: []const u8, comptime handler: anytype, options: JsonRouteOptions) !void {
+        try self.routeJson(.patch, path, handler, options);
+    }
+
+    pub fn deleteJson(self: *HttpServer, path: []const u8, comptime handler: anytype, options: JsonRouteOptions) !void {
+        try self.routeJson(.delete, path, handler, options);
+    }
+
     /// Generates an OpenAPI 3.0.3 document from all currently registered routes
     /// and serves it at `/openapi.json`. Call this after registering routes.
     /// Replaces any previously generated document.
     pub fn enableOpenApi(self: *HttpServer, config: openapi.Config) !void {
         var doc = openapi.OpenApiDocument.init(self.allocator, config);
         defer doc.deinit();
+        // Typed JSON routes first so their reflected schemas are recorded;
+        // `collectFromRouter` then fills in any remaining plain routes without
+        // overwriting them.
+        for (self.typed_routes.items) |record| {
+            try record.register(&doc, record.method, record.path, record.summary);
+        }
         try doc.collectFromRouter(&self.router_);
         const json = try doc.generate();
         if (self.openapi_json) |old| self.allocator.free(old);
@@ -459,4 +541,69 @@ test "enableOpenApi generates and caches a document" {
     const parsed2 = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, server.openapi_json.?, .{});
     defer parsed2.deinit();
     try std.testing.expectEqualStrings("Replaced", parsed2.value.object.get("info").?.object.get("title").?.string);
+}
+
+const TypedTestBody = struct { name: []const u8, count: u32 };
+const TypedTestReply = struct { greeting: []const u8, count: u32 };
+
+fn typedTestHandler(req: *http.HttpRequest, body: TypedTestBody) !TypedTestReply {
+    _ = req;
+    return .{ .greeting = body.name, .count = body.count + 1 };
+}
+
+test "postJson registers a typed route that parses body and serializes reply" {
+    var server = HttpServer.init(std.testing.allocator, .{});
+    defer server.deinit();
+
+    try server.postJson("/greet", typedTestHandler, .{ .summary = "Greet" });
+    try std.testing.expectEqual(@as(usize, 1), server.router().routeCount());
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = http.HttpRequest.initParsed(arena.allocator(), "POST", "/greet", "application/json", null, true);
+    defer req.deinit();
+    req.body_bytes =
+        \\{"name":"zig","count":4}
+    ;
+
+    const res = try server.router().dispatch(&req);
+    try std.testing.expectEqual(http.HttpStatus.ok, res.status);
+    try std.testing.expectEqualStrings("application/json", res.content_type);
+    try std.testing.expectEqualStrings("{\"greeting\":\"zig\",\"count\":5}", res.body);
+}
+
+test "enableOpenApi reflects typed route request and response schemas" {
+    var server = HttpServer.init(std.testing.allocator, .{});
+    defer server.deinit();
+
+    try server.postJson("/greet", typedTestHandler, .{ .summary = "Greet" });
+    try server.enableOpenApi(.{ .title = "Typed API" });
+
+    const json = server.openapi_json.?;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const op = parsed.value.object.get("paths").?.object
+        .get("/greet").?.object
+        .get("post").?.object;
+
+    // Request body schema reflects TypedTestBody.
+    const req_props = op.get("requestBody").?.object
+        .get("content").?.object
+        .get("application/json").?.object
+        .get("schema").?.object
+        .get("properties").?.object;
+    try std.testing.expect(req_props.get("name") != null);
+    try std.testing.expect(req_props.get("count") != null);
+
+    // Response schema reflects TypedTestReply.
+    const resp_props = op.get("responses").?.object
+        .get("200").?.object
+        .get("content").?.object
+        .get("application/json").?.object
+        .get("schema").?.object
+        .get("properties").?.object;
+    try std.testing.expect(resp_props.get("greeting") != null);
+    try std.testing.expect(resp_props.get("count") != null);
 }

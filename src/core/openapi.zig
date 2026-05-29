@@ -98,12 +98,24 @@ pub const OpenApiDocument = struct {
 
     /// Collects every HTTP route registered on `router` as an operation
     /// (without summaries). Path strings are borrowed from the router and must
-    /// outlive document generation.
+    /// outlive document generation. Routes already present (matched by method
+    /// and path) are skipped, so schemas added beforehand (e.g. via
+    /// `addJsonOperation`) are preserved.
     pub fn collectFromRouter(self: *OpenApiDocument, router: *const Router) !void {
         try router.forEachRoute(self, collectCallback);
     }
 
+    /// Returns true if an operation with the given method and path is already
+    /// registered.
+    pub fn hasOperation(self: *const OpenApiDocument, method: http.HttpMethod, path: []const u8) bool {
+        for (self.operations.items) |op| {
+            if (op.method == method and std.mem.eql(u8, op.path, path)) return true;
+        }
+        return false;
+    }
+
     fn collectCallback(self: *OpenApiDocument, method: http.HttpMethod, path: []const u8) anyerror!void {
+        if (self.hasOperation(method, path)) return;
         try self.addOperation(method, path, "");
     }
 

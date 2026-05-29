@@ -16,6 +16,7 @@ pub const HeaderMap = header_map.HeaderMap;
 
 pub const Router = @import("core/router.zig").Router;
 pub const RouteGroup = @import("core/router.zig").RouteGroup;
+pub const typed_route = @import("core/typed_route.zig");
 pub const MiddlewarePipeline = @import("core/middleware.zig").MiddlewarePipeline;
 pub const Middleware = @import("core/middleware.zig").Middleware;
 pub const MiddlewareHandler = @import("core/middleware.zig").MiddlewareHandler;
@@ -49,6 +50,7 @@ pub const zio_backend = @import("io/zio_backend.zig");
 test {
     _ = http;
     _ = Router;
+    _ = typed_route;
     _ = MiddlewarePipeline;
     _ = HttpServer;
     _ = MemoryPool;
