@@ -595,17 +595,6 @@ pub const HttpResponse = struct {
             return;
         }
 
-        if (self.hasPlainHeaders()) {
-            var headers_buf: [1 + max_inline_response_headers]Header = undefined;
-            const headers = self.buildPlainHeaders(&headers_buf);
-            try raw.respond(self.body, .{
-                .status = self.status.toStd(),
-                .keep_alive = self.keep_alive,
-                .extra_headers = headers,
-            });
-            return;
-        }
-
         var headers_buf: [24]Header = undefined;
         var cookie_values: [max_inline_cookies][256]u8 = undefined;
         const headers = self.buildHeaders(&headers_buf, &cookie_values);
@@ -621,20 +610,10 @@ pub const HttpResponse = struct {
     pub fn respondWithIo(self: HttpResponse, raw: *std.http.Server.Request, io: std.Io) !void {
         const fb = self.file orelse return self.respond(raw);
 
-        if (self.hasPlainHeaders()) {
-            var headers_buf: [1 + max_inline_response_headers]Header = undefined;
-            const headers = self.buildPlainHeaders(&headers_buf);
-            try self.respondFile(raw, io, fb, headers);
-            return;
-        }
-
         var headers_buf: [24]Header = undefined;
         var cookie_values: [max_inline_cookies][256]u8 = undefined;
         const headers = self.buildHeaders(&headers_buf, &cookie_values);
-        try self.respondFile(raw, io, fb, headers);
-    }
 
-    fn respondFile(self: HttpResponse, raw: *std.http.Server.Request, io: std.Io, fb: FileBody, headers: []const Header) !void {
         var dir = std.Io.Dir.cwd();
         var file = dir.openFile(io, fb.path, .{}) catch return error.FileOpenFailed;
         defer file.close(io);
@@ -659,25 +638,6 @@ pub const HttpResponse = struct {
                 return error.FileReadFailed;
         }
         try body_writer.end();
-    }
-
-    fn buildPlainHeaders(
-        self: *const HttpResponse,
-        headers_buf: *[1 + max_inline_response_headers]Header,
-    ) []const Header {
-        var count: usize = 0;
-        headers_buf[count] = .{ .name = "content-type", .value = self.content_type };
-        count += 1;
-        for (self.inline_headers[0..self.inline_header_count]) |response_header| {
-            headers_buf[count] = response_header;
-            count += 1;
-        }
-        for (self.extra_headers) |extra_header| {
-            if (count == headers_buf.len) break;
-            headers_buf[count] = extra_header;
-            count += 1;
-        }
-        return headers_buf[0..count];
     }
 
     /// 把响应头部列表（内容类型、内联/额外头部、content-range、set-cookie）
@@ -718,13 +678,6 @@ pub const HttpResponse = struct {
             self.extra_headers.len == 0 and
             self.inline_cookie_count == 0 and
             self.content_range_len == 0;
-    }
-
-    fn hasPlainHeaders(self: *const HttpResponse) bool {
-        return self.inline_cookie_count == 0 and
-            self.content_range_len == 0 and
-            self.inline_header_count <= max_inline_response_headers and
-            self.extra_headers.len <= max_inline_response_headers - self.inline_header_count;
     }
 };
 
