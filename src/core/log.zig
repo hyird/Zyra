@@ -130,6 +130,136 @@ pub const FileSink = struct {
     }
 };
 
+/// Asynchronous, batching file sink (double-buffered + background fiber).
+///
+/// Front-end `write` calls append the line into an in-memory buffer guarded by a
+/// `std.Io.Mutex`; a background fiber (spawned by `start`) periodically swaps the
+/// buffers and flushes the accumulated bytes to disk in one positional write.
+/// This decouples request-handling fibers from disk latency.
+///
+/// Back-pressure: when the pending buffer exceeds `backpressure_limit`, new lines
+/// are dropped and counted in `dropped` (read with `droppedCount`) instead of
+/// blocking the caller. Call `start(io)` once before logging and `stop(io)` to
+/// flush remaining data and join the background fiber. The sink binds the `io`
+/// passed to `start`; `write` uses it to lock the mutex, so all logging must
+/// happen on the same runtime.
+pub const AsyncFileSink = struct {
+    allocator: std.mem.Allocator,
+    file: FileSink,
+    io: std.Io = undefined,
+    mutex: std.Io.Mutex = .init,
+    cur_buf: std.ArrayListUnmanaged(u8) = .empty,
+    flush_buf: std.ArrayListUnmanaged(u8) = .empty,
+    flush_event: std.Io.Event = .unset,
+    running: std.atomic.Value(bool) = .init(false),
+    dropped: std.atomic.Value(u64) = .init(0),
+    group: std.Io.Group = .init,
+    flush_interval_ms: u64 = 1000,
+    backpressure_limit: usize = 8 * 1024 * 1024,
+
+    pub const Options = struct {
+        /// Truncate the file on open (see `FileSink.OpenOptions`).
+        truncate: bool = true,
+        flush_interval_ms: u64 = 1000,
+        backpressure_limit: usize = 8 * 1024 * 1024,
+    };
+
+    /// Opens `path` and prepares an async sink. Call `start(io)` to launch the
+    /// background flusher before logging.
+    pub fn open(allocator: std.mem.Allocator, io: std.Io, path: []const u8, options: Options) !AsyncFileSink {
+        const file = try FileSink.open(io, path, .{ .truncate = options.truncate });
+        return .{
+            .allocator = allocator,
+            .file = file,
+            .flush_interval_ms = options.flush_interval_ms,
+            .backpressure_limit = options.backpressure_limit,
+        };
+    }
+
+    /// Launches the background flush fiber. Must be called exactly once before
+    /// any logging and before `stop`.
+    pub fn start(self: *AsyncFileSink, io: std.Io) void {
+        self.io = io;
+        self.running.store(true, .release);
+        self.group.async(io, backgroundLoop, .{self});
+    }
+
+    /// Signals the background fiber to drain and exit, joins it, flushes any
+    /// residual bytes, frees buffers, and closes the file.
+    pub fn stop(self: *AsyncFileSink, io: std.Io) void {
+        self.running.store(false, .release);
+        self.flush_event.set(io);
+        self.group.await(io) catch {};
+        // Final drain of anything appended after the last loop iteration.
+        self.drainOnce(io);
+        self.cur_buf.deinit(self.allocator);
+        self.flush_buf.deinit(self.allocator);
+        self.file.close();
+    }
+
+    /// Number of lines dropped so far due to back-pressure.
+    pub fn droppedCount(self: *const AsyncFileSink) u64 {
+        return self.dropped.load(.acquire);
+    }
+
+    fn writeLine(ptr: *anyopaque, line: []const u8) anyerror!void {
+        const self: *AsyncFileSink = @ptrCast(@alignCast(ptr));
+        const io = self.io;
+        self.mutex.lockUncancelable(io);
+        const over_limit = self.cur_buf.items.len + line.len + 1 > self.backpressure_limit;
+        if (over_limit) {
+            self.mutex.unlock(io);
+            _ = self.dropped.fetchAdd(1, .acq_rel);
+            return;
+        }
+        self.cur_buf.appendSlice(self.allocator, line) catch {
+            self.mutex.unlock(io);
+            _ = self.dropped.fetchAdd(1, .acq_rel);
+            return;
+        };
+        self.cur_buf.append(self.allocator, '\n') catch {};
+        self.mutex.unlock(io);
+        self.flush_event.set(io);
+    }
+
+    /// Swaps `cur_buf` into `flush_buf` under the lock, then writes the captured
+    /// bytes to disk outside the lock so front-end writers are not blocked on I/O.
+    fn drainOnce(self: *AsyncFileSink, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        if (self.cur_buf.items.len == 0) {
+            self.mutex.unlock(io);
+            return;
+        }
+        const tmp = self.cur_buf;
+        self.cur_buf = self.flush_buf;
+        self.flush_buf = tmp;
+        self.cur_buf.clearRetainingCapacity();
+        self.mutex.unlock(io);
+
+        self.file.file.writePositionalAll(io, self.flush_buf.items, self.file.offset) catch {};
+        self.file.offset += self.flush_buf.items.len;
+    }
+
+    fn backgroundLoop(self: *AsyncFileSink) void {
+        const io = self.io;
+        const timeout: std.Io.Timeout = .{ .duration = .{
+            .raw = std.Io.Duration.fromMilliseconds(@intCast(self.flush_interval_ms)),
+            .clock = .awake,
+        } };
+        while (self.running.load(.acquire)) {
+            // Wait for either the flush interval or an explicit wake-up, then
+            // reset so the next iteration starts from a clean state.
+            self.flush_event.waitTimeout(io, timeout) catch {};
+            self.flush_event.reset();
+            self.drainOnce(io);
+        }
+    }
+
+    pub fn sink(self: *AsyncFileSink) Sink {
+        return .{ .ptr = self, .writeFn = writeLine };
+    }
+};
+
 pub const Logger = struct {
     sink: Sink,
     min_level: Level = .info,
@@ -631,6 +761,60 @@ test "FileSink appends structured lines and supports append mode" {
 
     var state = FileSinkState{ .io = runtime.io(), .path = "zig-cache-zyra-log-filesink-test.log" };
     try fileSinkRoot(&state);
+}
+
+const AsyncSinkState = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    err: ?anyerror = null,
+    contents_ok: bool = false,
+};
+
+fn asyncSinkImpl(state: *AsyncSinkState) anyerror!void {
+    const io = state.io;
+    var dir = std.Io.Dir.cwd();
+    dir.deleteFile(io, state.path) catch {};
+    defer dir.deleteFile(io, state.path) catch {};
+
+    var sink = try AsyncFileSink.open(state.allocator, io, state.path, .{ .flush_interval_ms = 10 });
+    sink.start(io);
+    const logger = Logger.init(sink.sink(), .info);
+    logger.info("alpha", &.{});
+    logger.warn("beta", &.{});
+    logger.debug("skipped", &.{}); // below min level, never reaches the sink
+    sink.stop(io); // drains and joins the background fiber
+
+    var file = try dir.openFile(io, state.path, .{});
+    defer file.close(io);
+    var buf: [256]u8 = undefined;
+    const n = try file.readPositionalAll(io, &buf, 0);
+    state.contents_ok = std.mem.eql(u8, buf[0..n], "INFO alpha\nWARN beta\n");
+}
+
+fn asyncSinkRoot(state: *AsyncSinkState) anyerror!void {
+    const io = state.io;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    const Wrapper = struct {
+        fn run(s: *AsyncSinkState) std.Io.Cancelable!void {
+            asyncSinkImpl(s) catch |e| {
+                s.err = e;
+            };
+        }
+    };
+    try group.concurrent(io, Wrapper.run, .{state});
+    group.await(io) catch {};
+    if (state.err) |e| return e;
+}
+
+test "AsyncFileSink batches lines from a background fiber" {
+    var runtime = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+
+    var state = AsyncSinkState{ .io = runtime.io(), .allocator = std.testing.allocator, .path = "zig-cache-zyra-log-asyncsink-test.log" };
+    try asyncSinkRoot(&state);
+    try std.testing.expect(state.contents_ok);
 }
 
 test "Level.fromLabel parses labels case-insensitively" {

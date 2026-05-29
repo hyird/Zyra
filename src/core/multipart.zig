@@ -113,6 +113,46 @@ pub fn freeParts(allocator: std.mem.Allocator, parts: []Part) void {
     allocator.free(parts);
 }
 
+/// Cached result wrapper stored on the request via a pointer attribute.
+const CachedParts = struct {
+    parts: []Part,
+    /// Set when parsing failed, so repeat calls return the same error without
+    /// re-parsing. `null` means success.
+    err: ?ParseError = null,
+};
+
+const cache_attr_key = "zyra.multipart.parts";
+
+/// Parses the request body as `multipart/form-data`, caching the result on the
+/// request so repeated calls within the same request reuse the parsed parts
+/// instead of re-parsing. Allocations use `req.allocator` (request-arena
+/// lifetime); the returned slices reference the request body and must not
+/// outlive the request. Returns `error.NotMultipart` when the request is not
+/// multipart.
+pub fn cachedParse(req: *http.HttpRequest) ParseError![]Part {
+    if (req.getAttributePtr(cache_attr_key)) |ptr| {
+        const cached: *CachedParts = @ptrCast(@alignCast(ptr));
+        if (cached.err) |e| return e;
+        return cached.parts;
+    }
+
+    const allocator = req.allocator;
+    const content_type = req.contentType() orelse return error.NotMultipart;
+
+    const cached = allocator.create(CachedParts) catch return error.OutOfMemory;
+    const result = parse(allocator, content_type, req.body());
+    cached.* = if (result) |parts|
+        .{ .parts = parts }
+    else |e|
+        .{ .parts = &.{}, .err = e };
+
+    // Best-effort cache; if storing the attribute fails, still return the result.
+    req.setAttributePtr(cache_attr_key, cached) catch {};
+
+    if (cached.err) |e| return e;
+    return cached.parts;
+}
+
 fn freePartsList(allocator: std.mem.Allocator, parts: *std.ArrayListUnmanaged(Part)) void {
     for (parts.items) |part| allocator.free(part.headers);
     parts.deinit(allocator);
@@ -263,4 +303,33 @@ test "parse via request content type and body" {
     const parts = try parse(req.allocator, req.contentType().?, req.body());
     try std.testing.expectEqual(@as(usize, 2), parts.len);
     try std.testing.expectEqualStrings("zig-dev", getField(parts, "username").?);
+}
+
+test "cachedParse parses once and reuses the cached result" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = http.HttpRequest.initParsed(arena.allocator(), "POST", "/upload", "multipart/form-data; boundary=X", null, true);
+    defer req.deinit();
+    req.body_bytes = test_body;
+
+    const first = try cachedParse(&req);
+    const second = try cachedParse(&req);
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+    // Same backing slice pointer -> the second call reused the cache.
+    try std.testing.expectEqual(first.ptr, second.ptr);
+    try std.testing.expectEqualStrings("zig-dev", getField(second, "username").?);
+}
+
+test "cachedParse returns NotMultipart for non-multipart requests" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = http.HttpRequest.initParsed(arena.allocator(), "POST", "/upload", "application/json", null, true);
+    defer req.deinit();
+    req.body_bytes = "{}";
+
+    try std.testing.expectError(error.NotMultipart, cachedParse(&req));
+    // Cached error path: a second call still reports the same error.
+    try std.testing.expectError(error.NotMultipart, cachedParse(&req));
 }
