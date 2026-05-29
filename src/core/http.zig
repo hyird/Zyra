@@ -71,6 +71,7 @@ pub const HttpStatus = enum(u10) {
 pub const Params = std.StringHashMapUnmanaged([]const u8);
 pub const QueryParams = std.StringArrayHashMapUnmanaged([]const u8);
 pub const Attributes = std.StringArrayHashMapUnmanaged([]const u8);
+pub const PtrAttributes = std.StringArrayHashMapUnmanaged(*anyopaque);
 
 const max_inline_params = 8;
 const max_inline_headers = 64;
@@ -121,6 +122,7 @@ pub const HttpRequest = struct {
     parsed_form_params: ?QueryParams = null,
     parsed_cookies: ?QueryParams = null,
     attributes: ?Attributes = null,
+    ptr_attributes: ?PtrAttributes = null,
 
     pub fn initParsed(
         allocator: std.mem.Allocator,
@@ -180,6 +182,7 @@ pub const HttpRequest = struct {
         if (self.parsed_form_params) |*params| params.deinit(self.allocator);
         if (self.parsed_cookies) |*cookies_| cookies_.deinit(self.allocator);
         if (self.attributes) |*attrs| attrs.deinit(self.allocator);
+        if (self.ptr_attributes) |*attrs| attrs.deinit(self.allocator);
     }
 
     pub fn addHeader(self: *HttpRequest, name: []const u8, value: []const u8) !void {
@@ -323,6 +326,22 @@ pub const HttpRequest = struct {
 
     pub fn getAttribute(self: *const HttpRequest, key: []const u8) ?[]const u8 {
         if (self.attributes) |attrs| return attrs.get(key);
+        return null;
+    }
+
+    /// Stores an opaque pointer attribute on the request. Unlike `setAttribute`
+    /// (which stores string values), this lets middleware attach references to
+    /// runtime objects (e.g. a session) for downstream handlers. The pointer is
+    /// not owned by the request; the caller manages its lifetime.
+    pub fn setAttributePtr(self: *HttpRequest, key: []const u8, value: *anyopaque) !void {
+        if (self.ptr_attributes == null) self.ptr_attributes = .{};
+        try self.ptr_attributes.?.put(self.allocator, key, value);
+    }
+
+    /// Retrieves an opaque pointer attribute previously set with
+    /// `setAttributePtr`, or null if absent.
+    pub fn getAttributePtr(self: *const HttpRequest, key: []const u8) ?*anyopaque {
+        if (self.ptr_attributes) |attrs| return attrs.get(key);
         return null;
     }
 
@@ -617,6 +636,22 @@ test "request helpers parse headers query cookies and attributes" {
 
     try req.setAttribute("trace_id", "t1");
     try std.testing.expectEqualStrings("t1", req.getAttribute("trace_id").?);
+}
+
+test "request pointer attributes round-trip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = HttpRequest.initParsed(arena.allocator(), "GET", "/", null, null, true);
+    defer req.deinit();
+
+    try std.testing.expect(req.getAttributePtr("obj") == null);
+
+    var value: u32 = 42;
+    try req.setAttributePtr("obj", &value);
+
+    const back: *u32 = @ptrCast(@alignCast(req.getAttributePtr("obj").?));
+    try std.testing.expectEqual(@as(u32, 42), back.*);
 }
 
 test "http method conversions" {

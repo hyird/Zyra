@@ -11,6 +11,12 @@ const router_mod = @import("router.zig");
 /// without calling `next`, or transform the response returned by `next`.
 pub const MiddlewareHandler = *const fn (*http.HttpRequest, *Next) anyerror!http.HttpResponse;
 
+/// Onion-model middleware that carries an opaque context pointer, enabling
+/// stateful middleware (CORS options, session managers, loggers) without heap
+/// closures. The context is supplied at registration time via
+/// `useOnionCtx`/`useOnionCtxValue` and passed back to the handler unchanged.
+pub const ContextHandler = *const fn (*anyopaque, *http.HttpRequest, *Next) anyerror!http.HttpResponse;
+
 /// A synchronous "before" hook. Returning a response short-circuits the chain;
 /// returning `null` continues to the next middleware/handler.
 pub const BeforeHandler = *const fn (*http.HttpRequest) anyerror!?http.HttpResponse;
@@ -23,13 +29,15 @@ pub const AfterHandler = *const fn (*http.HttpRequest, *http.HttpResponse) anyer
 /// Backwards-compatible alias for the simple before-style middleware.
 pub const Middleware = BeforeHandler;
 
-const EntryKind = enum { onion, before, before_after };
+const EntryKind = enum { onion, before, before_after, context };
 
 const Entry = struct {
     kind: EntryKind,
     onion: ?MiddlewareHandler = null,
     before: ?BeforeHandler = null,
     after: ?AfterHandler = null,
+    context_handler: ?ContextHandler = null,
+    context: ?*anyopaque = null,
 };
 
 /// Walks the middleware chain for a single request. Cheap to construct (no heap
@@ -48,6 +56,7 @@ pub const Next = struct {
             self.index += 1;
             switch (entry.kind) {
                 .onion => return entry.onion.?(req, self),
+                .context => return entry.context_handler.?(entry.context.?, req, self),
                 .before => {
                     if (try entry.before.?(req)) |response| return response;
                 },
@@ -83,6 +92,22 @@ pub const MiddlewarePipeline = struct {
     /// Registers a full onion-model middleware that controls calling `next`.
     pub fn useOnion(self: *MiddlewarePipeline, middleware: MiddlewareHandler) !void {
         try self.entries.append(self.allocator, .{ .kind = .onion, .onion = middleware });
+    }
+
+    /// Registers a context-carrying onion middleware. The opaque `context`
+    /// pointer is passed back to `handler` on every request, enabling stateful
+    /// middleware without heap-allocated closures. The caller owns `context`
+    /// and must keep it alive for the lifetime of the pipeline.
+    pub fn useOnionCtx(
+        self: *MiddlewarePipeline,
+        context: *anyopaque,
+        handler: ContextHandler,
+    ) !void {
+        try self.entries.append(self.allocator, .{
+            .kind = .context,
+            .context_handler = handler,
+            .context = context,
+        });
     }
 
     /// Registers a before/after pair sharing a single chain frame.
@@ -269,4 +294,35 @@ test "before/after pair runs after downstream" {
     const response = try pipeline.execute(&router, &req);
     try std.testing.expectEqualStrings("body", response.body);
     try std.testing.expectEqualStrings("done", response.header("x-after").?);
+}
+
+test "context onion middleware receives its context" {
+    var router = router_mod.Router.init(std.testing.allocator);
+    defer router.deinit();
+    const handler = struct {
+        fn ok(_: *http.HttpRequest) !http.HttpResponse {
+            return http.HttpResponse.text("core");
+        }
+    }.ok;
+    try router.get("/", handler);
+
+    var pipeline = MiddlewarePipeline.init(std.testing.allocator);
+    defer pipeline.deinit();
+
+    const Ctx = struct {
+        header_value: []const u8,
+        fn handle(ptr: *anyopaque, req: *http.HttpRequest, next: *Next) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var response = try next.run(req);
+            try response.setHeader("x-ctx", self.header_value);
+            return response;
+        }
+    };
+    var ctx = Ctx{ .header_value = "from-context" };
+    try pipeline.useOnionCtx(&ctx, Ctx.handle);
+
+    var req: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/", .target = "/" };
+    const response = try pipeline.execute(&router, &req);
+    try std.testing.expectEqualStrings("core", response.body);
+    try std.testing.expectEqualStrings("from-context", response.header("x-ctx").?);
 }

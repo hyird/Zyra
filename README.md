@@ -41,12 +41,29 @@ Implemented web-facing Hical-style API surface includes:
   registered operations (path params surfaced automatically). Call
   `server.enableOpenApi(.{ .title = ... })` after registering routes to
   auto-collect every route and serve the document at `/openapi.json`
-- WebSocket: RFC 6455 frame codec (`websocket.Frame` encode/decode with
-  masking) and handshake key derivation (`websocket.computeAcceptKey`).
-  Register a handler with `server.ws(path, handler)`; the server performs the
-  upgrade and runs the handler with a `WebSocketSession`
-  (`send`/`sendBinary`/`receive`/`close`)
+ - WebSocket: RFC 6455 frame codec (`websocket.Frame` encode/decode with
+   masking) and handshake key derivation (`websocket.computeAcceptKey`).
+   Register a handler with `server.ws(path, handler)`; the server performs the
+   upgrade and runs the handler with a `WebSocketSession`
+   (`send`/`sendBinary`/`receive`/`close`)
+ - CORS: `Cors`/`CorsOptions` context-onion middleware. Configure
+   `allowed_origins`/`allowed_methods`/`allowed_headers`, `expose_headers`,
+   `allow_credentials`, and `max_age_seconds`; preflight requests are answered
+   with `204` and the proper `Access-Control-*`/`Vary` headers. Register with
+   `cors.attach(server)` or `server.useOnionCtx(&cors, Cors.handle)`
+ - sessions: `Session`/`SessionManager` with `create`/`find`/`destroy`/
+   `regenerate`/`gc`/`count`; IDs are generated from `io.random`. The
+   `SessionMiddleware` attaches the active `*Session` to the request (read it
+   via `session.fromRequest(req)`). All session operations take `io: std.Io`
+   and lock via `std.Io.Mutex`; expiry uses `std.Io.Clock`
+ - WebSocket hub: `WsHub` tracks live connections behind a transport-agnostic
+   `Sink`, with `add`/`remove`/`join`/`leave`/`broadcast`/`broadcastBinary`/
+   `broadcastAll`/`sendTo`/`roomSize`/`connectionCount`. All methods take
+   `io: std.Io` and synchronize with `std.Io.Mutex`
+ - logging: structured `Logger` (`Level`/`Field`/`Sink`, `writerSink`) plus a
+   `LogMiddleware` context-onion that logs method/path/status and request
+   duration (sourced from `req.io` via `std.Io.Clock`)
 
-Not implemented yet: SSL/TLS and database/logging modules. Idle timeout,
+Not implemented yet: SSL/TLS and database modules. Idle timeout,
 graceful shutdown, and GC interval APIs are intentionally not exposed until they
 are fully implemented.

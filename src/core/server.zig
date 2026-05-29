@@ -62,6 +62,16 @@ pub const HttpServer = struct {
         try self.middleware_.useOnion(middleware);
     }
 
+    /// Registers a context-carrying onion middleware (e.g. CORS, sessions).
+    /// `context` must outlive the server.
+    pub fn useOnionCtx(
+        self: *HttpServer,
+        context: *anyopaque,
+        handler: @import("middleware.zig").ContextHandler,
+    ) !void {
+        try self.middleware_.useOnionCtx(context, handler);
+    }
+
     pub fn useBeforeAfter(
         self: *HttpServer,
         before: @import("middleware.zig").BeforeHandler,
