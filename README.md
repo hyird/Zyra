@@ -22,7 +22,9 @@ zig build run
 Implemented web-facing Hical-style API surface includes:
 
 - route methods: `get`, `post`, `put`, `patch`, `delete`/`del`, `head`, `options`
-- `Router.group()` / `RouteGroup` prefix routing
+- `Router.group()` / `RouteGroup` prefix routing with group-level middleware
+  (`use`/`useBeforeAfter`); group before/after hooks run onion-style around only
+  that group's routes and are inherited by nested groups
 - request helpers: `header`, `query`, `queryParam`, `queryParams`, `cookie`,
   `cookies`, `formParam`, `formParams`, `body`, `contentType`, `readJson`,
   `jsonResponse`, path params (string via `param`; typed via `paramInt`,
@@ -76,21 +78,30 @@ Implemented web-facing Hical-style API surface includes:
    `Sink`, with `add`/`remove`/`join`/`leave`/`broadcast`/`broadcastBinary`/
    `broadcastAll`/`sendTo`/`roomSize`/`connectionCount`. All methods take
    `io: std.Io` and synchronize with `std.Io.Mutex`
-  - logging: structured `Logger` (`Level`/`Field`/`Sink`, `writerSink`) plus a
-    `LogMiddleware` context-onion that logs method/path/status and request
-    duration (sourced from `req.io` via `std.Io.Clock`). `FileSink` writes log
-    lines to a file via `std.Io.File` positional writes (truncate by default,
-    or append with `.{ .truncate = false }`)
+   - logging: structured `Logger` (`Level`/`Field`/`Sink`, `writerSink`) plus a
+     `LogMiddleware` context-onion that logs method/path/status and request
+     duration (sourced from `req.io` via `std.Io.Clock`). `FileSink` writes log
+     lines to a file via `std.Io.File` positional writes (truncate by default,
+     or append with `.{ .truncate = false }`). `LogChannel`/`LogChannelRegistry`
+     provide named channels with atomic, runtime-adjustable levels; `LogAdmin`
+     is a context-onion exposing `GET`/`PUT {prefix}/log-level` (default
+     `/admin`) to inspect and change channel levels at runtime, with an optional
+     `AdminAuthCheck` for access control
   - header container: `HeaderMap`, an allocator-backed, case-insensitive
     multi-value header store (`set`/`insert`/`erase`/`find`/`findAll`/
     `contains`/`count`/`reserve`/`clear`); borrows name/value slices
   - routing: path params (`:name`/`{name}`) and wildcard catch-all (`*`,
     `*name`, `{*name}`) which binds the entire trailing path segment(s) to a
     capture; the wildcard must be the last segment
-  - idle timeout: `ServerOptions.idle_timeout_ms` bounds the wait for the next
-    request on a kept-alive connection (0 disables). Implemented via zio's
-    recv+timer completion racing inside the event loop, so it fires correctly
-    under epoll/io_uring readiness models with no extra coroutine
+   - idle timeout: `ServerOptions.idle_timeout_ms` bounds the wait for the next
+     request on a kept-alive connection (0 disables). Implemented via zio's
+     recv+timer completion racing inside the event loop, so it fires correctly
+     under epoll/io_uring readiness models with no extra coroutine
+   - graceful shutdown: `server.requestShutdown(io)` (threadsafe) signals the
+     accept loop to stop taking new connections; `start` then drains in-flight
+     handlers via `Io.Group.await` before returning. `server.isAccepting()`
+     reports whether new connections are still being accepted
 
-Not implemented yet: SSL/TLS and database modules. Graceful shutdown and GC
-interval APIs are intentionally not exposed until they are fully implemented.
+Not implemented yet: SSL/TLS and database modules, and WebSocket
+`permessage-deflate` compression. These are intentionally not exposed until
+they are fully implemented.

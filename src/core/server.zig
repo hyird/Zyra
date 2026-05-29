@@ -53,6 +53,13 @@ pub const HttpServer = struct {
     middleware_: MiddlewarePipeline,
     memory_pool: MemoryPool,
     active_connections: std.atomic.Value(usize),
+    /// Signaled by `requestShutdown` to begin a graceful shutdown: the accept
+    /// loop stops taking new connections and in-flight handlers are drained
+    /// before `start` returns. Threadsafe; safe to set from another thread.
+    shutdown_event: std.Io.Event = .unset,
+    /// Set once the accept loop stops taking new connections, so handlers (and
+    /// tests) can observe that draining is underway.
+    accepting: std.atomic.Value(bool) = .init(false),
     /// Pre-generated OpenAPI JSON document, served at `openapi_path` when set.
     openapi_json: ?[]const u8 = null,
     openapi_path: []const u8 = "/openapi.json",
@@ -224,20 +231,56 @@ pub const HttpServer = struct {
 
         std.log.info("Zyra listening on {f}", .{listener.socket.address});
 
+        // In-flight connection handlers live in this group. On shutdown we
+        // `await` (not `cancel`) the group so active requests finish draining.
         var group: Io.Group = .init;
-        defer group.cancel(io);
 
+        self.accepting.store(true, .release);
+
+        // Run the accept loop concurrently so the calling fiber can wait for the
+        // shutdown signal. When that signal arrives we cancel the accept loop,
+        // which interrupts the blocked `accept` at its next cancelation point.
+    var accept_future = io.async(HttpServer.acceptLoop, .{ self, io, &listener, &group });
+
+        // Block until a graceful shutdown is requested (or never, if it isn't).
+        self.shutdown_event.waitUncancelable(io);
+
+        // Stop accepting new connections, then drain handlers already running.
+        self.accepting.store(false, .release);
+        _ = accept_future.cancel(io);
+        group.await(io) catch {};
+    }
+
+    /// Requests a graceful shutdown: stops accepting new connections and lets
+    /// in-flight requests finish before `start` returns. Threadsafe; may be
+    /// called from another fiber/thread (e.g. a signal handler bridge).
+    pub fn requestShutdown(self: *HttpServer, io: Io) void {
+        self.shutdown_event.set(io);
+    }
+
+    /// True while the server is still accepting new connections. Becomes false
+    /// once a graceful shutdown has begun.
+    pub fn isAccepting(self: *const HttpServer) bool {
+        return self.accepting.load(.acquire);
+    }
+
+    /// Accept loop, run as a cancelable task. Cancellation (triggered by
+    /// `requestShutdown`) surfaces as `error.Canceled` from `accept`, which ends
+    /// the loop without taking further connections.
+    fn acceptLoop(self: *HttpServer, io: Io, listener: *Io.net.Server, group: *Io.Group) void {
         while (true) {
-            const stream = try listener.accept(io);
-            errdefer stream.close(io);
+            const stream = listener.accept(io) catch return;
             if (!self.tryAcquireConnection()) {
                 stream.close(io);
                 continue;
             }
-            errdefer self.releaseConnection();
-            try group.concurrent(io, handleClient, .{ self, io, stream });
+            group.concurrent(io, handleClient, .{ self, io, stream }) catch {
+                self.releaseConnection();
+                stream.close(io);
+            };
         }
     }
+
 
     fn tryAcquireConnection(self: *HttpServer) bool {
         if (self.options.max_connections == 0) {
@@ -606,4 +649,111 @@ test "enableOpenApi reflects typed route request and response schemas" {
         .get("properties").?.object;
     try std.testing.expect(resp_props.get("greeting") != null);
     try std.testing.expect(resp_props.get("count") != null);
+}
+
+// --- Graceful shutdown -------------------------------------------------------
+
+const ShutdownTestState = struct {
+    server: *HttpServer,
+    io: Io,
+    err: ?anyerror = null,
+    served_status: ?http.HttpStatus = null,
+};
+
+/// Mirrors `HttpServer.start` but binds an ephemeral port and reports the bound
+/// address back through `state` so the test client can connect. Runs the accept
+/// loop concurrently, then waits for the shutdown signal and drains.
+fn shutdownServerMain(state: *ShutdownTestState) anyerror!void {
+    const self = state.server;
+    const io = state.io;
+
+    const addr = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+
+    // Publish the actual bound port for the client (port 0 -> OS-assigned).
+    self.options.port = listener.socket.address.getPort();
+
+    var group: Io.Group = .init;
+    self.accepting.store(true, .release);
+    var accept_future = io.async(HttpServer.acceptLoop, .{ self, io, &listener, &group });
+
+    self.shutdown_event.waitUncancelable(io);
+
+    self.accepting.store(false, .release);
+    _ = accept_future.cancel(io);
+    group.await(io) catch {};
+}
+
+fn shutdownClientMain(state: *ShutdownTestState) anyerror!void {
+    const self = state.server;
+    const io = state.io;
+
+    // Wait until the server is accepting and has a bound port.
+    while (!self.isAccepting() or self.options.port == 0) {
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+
+    // One real request over loopback, then graceful shutdown.
+    const addr = try Io.net.IpAddress.parseIp4("127.0.0.1", self.options.port);
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var wbuf: [256]u8 = undefined;
+    var writer = stream.writer(io, &wbuf);
+    try writer.interface.writeAll("GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    try writer.interface.flush();
+
+    var rbuf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &rbuf);
+    // Read the status line; tolerate short reads.
+    var line_buf: [64]u8 = undefined;
+    const n = reader.interface.readSliceShort(&line_buf) catch 0;
+    if (n > 0 and std.mem.indexOf(u8, line_buf[0..n], "200") != null) {
+        state.served_status = .ok;
+    }
+
+    // Request graceful shutdown; the server fiber drains and returns.
+    self.requestShutdown(io);
+}
+
+fn shutdownTestRoot(state: *ShutdownTestState) anyerror!void {
+    const io = state.io;
+    var group: Io.Group = .init;
+    const Wrap = struct {
+        fn server(s: *ShutdownTestState) Io.Cancelable!void {
+            shutdownServerMain(s) catch |e| {
+                s.err = e;
+            };
+        }
+        fn client(s: *ShutdownTestState) Io.Cancelable!void {
+            shutdownClientMain(s) catch |e| {
+                if (s.err == null) s.err = e;
+            };
+        }
+    };
+    try group.concurrent(io, Wrap.server, .{state});
+    try group.concurrent(io, Wrap.client, .{state});
+    group.await(io) catch {};
+    if (state.err) |e| return e;
+}
+
+fn pingHandler(_: *http.HttpRequest) !http.HttpResponse {
+    return http.HttpResponse.text("pong");
+}
+
+test "requestShutdown stops accepting and drains in-flight handlers" {
+    var runtime = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+
+    var server = HttpServer.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    try server.router().get("/ping", pingHandler);
+
+    var state = ShutdownTestState{ .server = &server, .io = runtime.io() };
+    try shutdownTestRoot(&state);
+
+    // The request was served and the server is no longer accepting.
+    try std.testing.expectEqual(http.HttpStatus.ok, state.served_status orelse return error.NoResponse);
+    try std.testing.expect(!server.isAccepting());
 }

@@ -32,6 +32,16 @@ pub const Level = enum(u8) {
             .err => "ERROR",
         };
     }
+
+    /// Parses a level label (case-insensitive). Accepts the canonical labels
+    /// (`DEBUG`/`INFO`/`WARN`/`ERROR`) as well as the alias `WARNING`.
+    pub fn fromLabel(text: []const u8) ?Level {
+        if (std.ascii.eqlIgnoreCase(text, "debug")) return .debug;
+        if (std.ascii.eqlIgnoreCase(text, "info")) return .info;
+        if (std.ascii.eqlIgnoreCase(text, "warn") or std.ascii.eqlIgnoreCase(text, "warning")) return .warn;
+        if (std.ascii.eqlIgnoreCase(text, "error") or std.ascii.eqlIgnoreCase(text, "err")) return .err;
+        return null;
+    }
 };
 
 /// A structured log field. Values are strings; format numbers with the caller's
@@ -166,7 +176,126 @@ pub const Logger = struct {
     }
 };
 
-/// Request-logging middleware. Construct with `init(logger)` and register via
+/// A named logging channel with its own runtime-adjustable level and sink.
+///
+/// Channels route categories of logs (e.g. `access`, `audit`, `perf`) to
+/// distinct destinations and let operators tune each category's verbosity
+/// independently. The level is stored atomically so it can be changed at
+/// runtime (e.g. via the log-admin endpoints) while requests are logging.
+pub const LogChannel = struct {
+    name: []const u8,
+    sink: Sink,
+    level_raw: std.atomic.Value(u8),
+
+    pub fn init(name: []const u8, sink: Sink, min_level: Level) LogChannel {
+        return .{ .name = name, .sink = sink, .level_raw = .init(@intFromEnum(min_level)) };
+    }
+
+    pub fn level(self: *const LogChannel) Level {
+        return @enumFromInt(self.level_raw.load(.acquire));
+    }
+
+    pub fn setLevel(self: *LogChannel, new_level: Level) void {
+        self.level_raw.store(@intFromEnum(new_level), .release);
+    }
+
+    pub fn enabled(self: *const LogChannel, lvl: Level) bool {
+        return @intFromEnum(lvl) >= self.level_raw.load(.acquire);
+    }
+
+    /// Emits a structured line on this channel, filtered by the channel's
+    /// current level. Formatting matches `Logger.log` and is skipped entirely
+    /// below the threshold.
+    pub fn emit(self: *const LogChannel, lvl: Level, message: []const u8, fields: []const Field) void {
+        if (!self.enabled(lvl)) return;
+        var buf: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.writeAll(lvl.label()) catch {};
+        w.writeByte(' ') catch {};
+        w.writeAll(message) catch {};
+        for (fields) |field| {
+            w.writeByte(' ') catch {};
+            w.writeAll(field.key) catch {};
+            w.writeByte('=') catch {};
+            w.writeAll(field.value) catch {};
+        }
+        self.sink.write(buf[0..w.end]);
+    }
+};
+
+/// Thread-safe registry of named `LogChannel`s.
+///
+/// Channels are typically created at startup and looked up by name at runtime.
+/// The registry owns each channel (heap-allocated) and frees them on `deinit`.
+/// Channel names are duplicated into registry-owned storage. A mutex guards the
+/// map; per-channel level changes use the channel's own atomic and need no lock.
+pub const LogChannelRegistry = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Io.Mutex = .init,
+    channels: std.StringHashMapUnmanaged(*LogChannel) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) LogChannelRegistry {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *LogChannelRegistry) void {
+        var it = self.channels.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.channels.deinit(self.allocator);
+    }
+
+    /// Returns the existing channel named `name`, or creates one with `sink`
+    /// and `min_level`. The returned pointer is stable for the registry's
+    /// lifetime. `io` is required for mutex locking.
+    pub fn getOrCreate(
+        self: *LogChannelRegistry,
+        io: std.Io,
+        name: []const u8,
+        sink: Sink,
+        min_level: Level,
+    ) !*LogChannel {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        if (self.channels.get(name)) |existing| return existing;
+
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+        const channel = try self.allocator.create(LogChannel);
+        errdefer self.allocator.destroy(channel);
+        channel.* = LogChannel.init(name_copy, sink, min_level);
+        try self.channels.put(self.allocator, name_copy, channel);
+        return channel;
+    }
+
+    /// Returns the channel named `name`, or null if absent.
+    pub fn get(self: *LogChannelRegistry, io: std.Io, name: []const u8) ?*LogChannel {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.channels.get(name);
+    }
+
+    /// Calls `callback(ctx, channel)` for each registered channel while holding
+    /// the registry lock. Use for read-only iteration (e.g. listing levels).
+    pub fn forEach(
+        self: *LogChannelRegistry,
+        io: std.Io,
+        ctx: anytype,
+        comptime callback: fn (@TypeOf(ctx), *LogChannel) anyerror!void,
+    ) anyerror!void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var it = self.channels.iterator();
+        while (it.next()) |entry| {
+            try callback(ctx, entry.value_ptr.*);
+        }
+    }
+};
+
+
 /// `attach(server)` or `server.useOnionCtx(&mw, LogMiddleware.handle)`. Logs one
 /// line per request: method, path, status, and duration in microseconds.
 pub const LogMiddleware = struct {
@@ -211,9 +340,108 @@ pub const LogMiddleware = struct {
     }
 };
 
+/// Optional authentication check for the log-admin endpoints. Return `null` to
+/// allow the request; return a response (e.g. 401/403) to reject it.
+pub const AdminAuthCheck = *const fn (*http.HttpRequest) anyerror!?http.HttpResponse;
+
+/// Runtime log-level administration as a context middleware.
+///
+/// Intercepts two endpoints under `prefix` (default `/admin`):
+///   - `GET  {prefix}/log-level`  -> JSON `{ "channels": { name: "LEVEL", ... } }`
+///   - `PUT  {prefix}/log-level`  -> body `{ "channel": "access", "level": "WARN" }`
+///     adjusts a single channel's level; responds 200 on success, 400 on bad
+///     input, 404 when the channel is unknown.
+///
+/// Requests to other paths are passed through to `next`. Register via
+/// `attach(server)` (uses `server.useOnionCtx`).
+///
+/// WARNING: these endpoints mutate logging behavior. In production you MUST
+/// supply an `auth` check to prevent unauthorized level changes.
+pub const LogAdmin = struct {
+    registry: *LogChannelRegistry,
+    prefix: []const u8 = "/admin",
+    auth: ?AdminAuthCheck = null,
+
+    pub fn init(registry: *LogChannelRegistry) LogAdmin {
+        return .{ .registry = registry };
+    }
+
+    pub fn attach(self: *LogAdmin, server: anytype) !void {
+        try server.useOnionCtx(self, handle);
+    }
+
+    /// The endpoint path this admin instance handles (`{prefix}/log-level`).
+    /// Computed on demand against a caller buffer to avoid allocation.
+    fn matchesPath(self: *const LogAdmin, path: []const u8) bool {
+        // path == prefix ++ "/log-level"
+        if (!std.mem.startsWith(u8, path, self.prefix)) return false;
+        const rest = path[self.prefix.len..];
+        return std.mem.eql(u8, rest, "/log-level");
+    }
+
+    pub fn handle(ctx: *anyopaque, req: *http.HttpRequest, next: *middleware.Next) anyerror!http.HttpResponse {
+        const self: *LogAdmin = @ptrCast(@alignCast(ctx));
+        if (!self.matchesPath(req.path)) return next.run(req);
+
+        if (self.auth) |auth| {
+            if (try auth(req)) |denied| return denied;
+        }
+
+        return switch (req.method) {
+            .get => self.handleGet(req),
+            .put => self.handlePut(req),
+            else => http.HttpResponse.methodNotAllowed("GET, PUT"),
+        };
+    }
+
+    fn handleGet(self: *LogAdmin, req: *http.HttpRequest) anyerror!http.HttpResponse {
+        const io = req.io orelse return http.HttpResponse.serverError();
+
+        var out = std.Io.Writer.Allocating.init(req.allocator);
+        defer out.deinit();
+        var w = std.json.Stringify{ .writer = &out.writer };
+
+        const Emit = struct {
+            fn cb(writer: *std.json.Stringify, channel: *LogChannel) anyerror!void {
+                try writer.objectField(channel.name);
+                try writer.write(channel.level().label());
+            }
+        };
+
+        try w.beginObject();
+        try w.objectField("channels");
+        try w.beginObject();
+        try self.registry.forEach(io, &w, Emit.cb);
+        try w.endObject();
+        try w.endObject();
+
+        const body = try out.toOwnedSlice();
+        return http.HttpResponse.json(body);
+    }
+
+    const PutBody = struct { channel: []const u8, level: []const u8 };
+
+    fn handlePut(self: *LogAdmin, req: *http.HttpRequest) anyerror!http.HttpResponse {
+        const io = req.io orelse return http.HttpResponse.serverError();
+
+        const parsed = req.readJson(PutBody) catch
+            return http.HttpResponse.badRequest("invalid JSON body");
+
+        const new_level = Level.fromLabel(parsed.level) orelse
+            return http.HttpResponse.badRequest("unknown level");
+
+        const channel = self.registry.get(io, parsed.channel) orelse
+            return http.HttpResponse.notFound();
+
+        channel.setLevel(new_level);
+        return http.HttpResponse.json("{\"ok\":true}");
+    }
+};
+
 // ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------
+
 
 const router_mod = @import("router.zig");
 
@@ -403,4 +631,141 @@ test "FileSink appends structured lines and supports append mode" {
 
     var state = FileSinkState{ .io = runtime.io(), .path = "zig-cache-zyra-log-filesink-test.log" };
     try fileSinkRoot(&state);
+}
+
+test "Level.fromLabel parses labels case-insensitively" {
+    try std.testing.expectEqual(Level.debug, Level.fromLabel("DEBUG").?);
+    try std.testing.expectEqual(Level.info, Level.fromLabel("info").?);
+    try std.testing.expectEqual(Level.warn, Level.fromLabel("Warning").?);
+    try std.testing.expectEqual(Level.err, Level.fromLabel("error").?);
+    try std.testing.expect(Level.fromLabel("nope") == null);
+}
+
+test "LogChannel filters by its own runtime-adjustable level" {
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+
+    var channel = LogChannel.init("access", cap.sink(), .warn);
+    channel.emit(.info, "ignored", &.{}); // below level
+    channel.emit(.warn, "kept", &.{.{ .key = "k", .value = "v" }});
+    try std.testing.expectEqual(@as(usize, 1), cap.lines.items.len);
+    try std.testing.expectEqualStrings("WARN kept k=v", cap.lines.items[0]);
+
+    // Lower the level at runtime; previously filtered level now passes.
+    channel.setLevel(.debug);
+    try std.testing.expectEqual(Level.debug, channel.level());
+    channel.emit(.info, "now-visible", &.{});
+    try std.testing.expectEqual(@as(usize, 2), cap.lines.items.len);
+    try std.testing.expectEqualStrings("INFO now-visible", cap.lines.items[1]);
+}
+
+const AdminTestState = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    err: ?anyerror = null,
+};
+
+fn adminTestImpl(state: *AdminTestState) anyerror!void {
+    const io = state.io;
+    const alloc = state.allocator;
+
+    var cap = Capture.init(alloc);
+    defer cap.deinit();
+
+    var registry = LogChannelRegistry.init(alloc);
+    defer registry.deinit();
+
+    // getOrCreate creates once, returns the same pointer thereafter.
+    const access = try registry.getOrCreate(io, "access", cap.sink(), .info);
+    const access2 = try registry.getOrCreate(io, "access", cap.sink(), .err);
+    try std.testing.expectEqual(access, access2);
+    try std.testing.expectEqual(Level.info, access.level()); // not overwritten
+    _ = try registry.getOrCreate(io, "audit", cap.sink(), .warn);
+
+    try std.testing.expect(registry.get(io, "access") != null);
+    try std.testing.expect(registry.get(io, "missing") == null);
+
+    var admin = LogAdmin.init(&registry);
+
+    // GET returns each channel's level as JSON.
+    {
+        var req = http.HttpRequest.initParsed(alloc, "GET", "/admin/log-level", null, null, true);
+        defer req.deinit();
+        req.io = io;
+        const res = try admin.handleGet(&req);
+        defer alloc.free(res.body);
+        try std.testing.expectEqual(http.HttpStatus.ok, res.status);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, res.body, .{});
+        defer parsed.deinit();
+        const channels = parsed.value.object.get("channels").?.object;
+        try std.testing.expectEqualStrings("INFO", channels.get("access").?.string);
+        try std.testing.expectEqualStrings("WARN", channels.get("audit").?.string);
+    }
+
+    // PUT adjusts a channel's level.
+    {
+        var req = http.HttpRequest.initParsed(alloc, "PUT", "/admin/log-level", "application/json", null, true);
+        defer req.deinit();
+        req.io = io;
+        req.body_bytes =
+            \\{"channel":"access","level":"ERROR"}
+        ;
+        const res = try admin.handlePut(&req);
+        try std.testing.expectEqual(http.HttpStatus.ok, res.status);
+        try std.testing.expectEqual(Level.err, access.level());
+    }
+
+    // PUT with unknown channel -> 404.
+    {
+        var req = http.HttpRequest.initParsed(alloc, "PUT", "/admin/log-level", "application/json", null, true);
+        defer req.deinit();
+        req.io = io;
+        req.body_bytes =
+            \\{"channel":"ghost","level":"INFO"}
+        ;
+        const res = try admin.handlePut(&req);
+        try std.testing.expectEqual(http.HttpStatus.not_found, res.status);
+    }
+
+    // PUT with bad level -> 400.
+    {
+        var req = http.HttpRequest.initParsed(alloc, "PUT", "/admin/log-level", "application/json", null, true);
+        defer req.deinit();
+        req.io = io;
+        req.body_bytes =
+            \\{"channel":"access","level":"LOUD"}
+        ;
+        const res = try admin.handlePut(&req);
+        try std.testing.expectEqual(http.HttpStatus.bad_request, res.status);
+    }
+
+    // matchesPath only matches the configured endpoint.
+    try std.testing.expect(admin.matchesPath("/admin/log-level"));
+    try std.testing.expect(!admin.matchesPath("/admin/other"));
+    try std.testing.expect(!admin.matchesPath("/log-level"));
+}
+
+fn adminTestRoot(state: *AdminTestState) anyerror!void {
+    const io = state.io;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    const Wrapper = struct {
+        fn run(s: *AdminTestState) std.Io.Cancelable!void {
+            adminTestImpl(s) catch |e| {
+                s.err = e;
+            };
+        }
+    };
+    try group.concurrent(io, Wrapper.run, .{state});
+    group.await(io) catch {};
+    if (state.err) |e| return e;
+}
+
+test "LogChannelRegistry and LogAdmin manage channel levels over HTTP" {
+    var runtime = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+
+    var state = AdminTestState{ .io = runtime.io(), .allocator = std.testing.allocator };
+    try adminTestRoot(&state);
 }

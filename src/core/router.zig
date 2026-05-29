@@ -4,23 +4,79 @@ const websocket = @import("websocket.zig");
 
 pub const RouteHandler = *const fn (*http.HttpRequest) anyerror!http.HttpResponse;
 
+/// A synchronous "before" hook for a route group. Returning a response
+/// short-circuits the route (and runs the already-entered groups' `after`
+/// hooks); returning `null` continues to the next group hook or the handler.
+pub const GroupBeforeHandler = *const fn (*http.HttpRequest) anyerror!?http.HttpResponse;
+
+/// A synchronous "after" hook for a route group. Runs after the handler (or a
+/// short-circuiting `before`) produces a response and may mutate it.
+pub const GroupAfterHandler = *const fn (*http.HttpRequest, *http.HttpResponse) anyerror!void;
+
+/// One group-level middleware: an optional before hook and an optional after
+/// hook. Applied only to routes registered through the owning `RouteGroup`.
+pub const GroupMiddleware = struct {
+    before: ?GroupBeforeHandler = null,
+    after: ?GroupAfterHandler = null,
+};
+
 /// Handler for an upgraded WebSocket connection. Runs the receive/send loop and
 /// returns when the connection should be closed.
 pub const WsHandler = *const fn (*websocket.WebSocketSession) anyerror!void;
 
 const method_count = @typeInfo(http.HttpMethod).@"enum".fields.len;
 
+/// A stored route: the user's handler plus the (possibly empty) chain of
+/// group-level middleware that wraps it. The middleware slice is borrowed and
+/// must outlive the router (group middleware chains are owned by the router's
+/// `owned_chains` arena-like list).
+pub const RouteEndpoint = struct {
+    handler: RouteHandler,
+    middleware: []const GroupMiddleware = &.{},
+
+    /// Runs the group middleware chain (before hooks in order, after hooks in
+    /// reverse) around the handler. A short-circuiting before hook still runs
+    /// the after hooks of the groups already entered.
+    pub fn invoke(self: RouteEndpoint, req: *http.HttpRequest) anyerror!http.HttpResponse {
+        var entered: usize = 0;
+        for (self.middleware) |mw| {
+            entered += 1;
+            if (mw.before) |before| {
+                if (try before(req)) |short| {
+                    var resp = short;
+                    try runAfter(self.middleware[0..entered], req, &resp);
+                    return resp;
+                }
+            }
+        }
+        var resp = try self.handler(req);
+        try runAfter(self.middleware[0..entered], req, &resp);
+        return resp;
+    }
+
+    fn runAfter(chain: []const GroupMiddleware, req: *http.HttpRequest, resp: *http.HttpResponse) anyerror!void {
+        var i = chain.len;
+        while (i > 0) {
+            i -= 1;
+            if (chain[i].after) |after| try after(req, resp);
+        }
+    }
+};
+
 const RouteEntry = struct {
     path: []const u8,
-    handler: RouteHandler,
+    endpoint: RouteEndpoint,
 };
 
 pub const Router = struct {
     allocator: std.mem.Allocator,
-    static_routes: [method_count]std.StringHashMapUnmanaged(RouteHandler) = .{std.StringHashMapUnmanaged(RouteHandler).empty} ** method_count,
+    static_routes: [method_count]std.StringHashMapUnmanaged(RouteEndpoint) = .{std.StringHashMapUnmanaged(RouteEndpoint).empty} ** method_count,
     param_routes: [method_count]std.ArrayListUnmanaged(RouteEntry) = .{std.ArrayListUnmanaged(RouteEntry).empty} ** method_count,
     path_methods: std.StringHashMapUnmanaged(u16) = .{},
     owned_paths: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Owns the merged group-middleware chains created by `RouteGroup`s, freed
+    /// in `deinit`. Endpoints borrow slices from these.
+    owned_chains: std.ArrayListUnmanaged([]GroupMiddleware) = .empty,
     ws_routes: std.StringHashMapUnmanaged(WsHandler) = .{},
 
     pub fn init(allocator: std.mem.Allocator) Router {
@@ -34,14 +90,23 @@ pub const Router = struct {
         self.ws_routes.deinit(self.allocator);
         for (self.owned_paths.items) |path| self.allocator.free(path);
         self.owned_paths.deinit(self.allocator);
+        for (self.owned_chains.items) |chain| self.allocator.free(chain);
+        self.owned_chains.deinit(self.allocator);
     }
 
     pub fn route(self: *Router, method: http.HttpMethod, path: []const u8, handler: RouteHandler) !void {
+        try self.routeEndpoint(method, path, .{ .handler = handler });
+    }
+
+    /// Registers a route carrying an explicit endpoint (handler + group
+    /// middleware chain). Used by `RouteGroup` to attach group-scoped
+    /// middleware; most callers use `route`/the verb helpers instead.
+    pub fn routeEndpoint(self: *Router, method: http.HttpMethod, path: []const u8, endpoint: RouteEndpoint) !void {
         const index = methodIndex(method);
         if (isParamPath(path)) {
-            try self.param_routes[index].append(self.allocator, .{ .path = path, .handler = handler });
+            try self.param_routes[index].append(self.allocator, .{ .path = path, .endpoint = endpoint });
         } else {
-            try self.static_routes[index].put(self.allocator, path, handler);
+            try self.static_routes[index].put(self.allocator, path, endpoint);
         }
 
         const bit = methodBit(method);
@@ -130,13 +195,13 @@ pub const Router = struct {
     pub fn dispatch(self: *const Router, req: *http.HttpRequest) !http.HttpResponse {
         const index = methodIndex(req.method);
 
-        if (self.static_routes[index].get(req.path)) |handler| {
-            return handler(req);
+        if (self.static_routes[index].get(req.path)) |endpoint| {
+            return endpoint.invoke(req);
         }
 
         for (self.param_routes[index].items) |entry| {
             const checkpoint = req.paramCheckpoint();
-            if (try matchParamPath(entry.path, req.path, req)) return entry.handler(req);
+            if (try matchParamPath(entry.path, req.path, req)) return entry.endpoint.invoke(req);
             req.rollbackParams(checkpoint);
         }
 
@@ -180,51 +245,94 @@ fn allowHeader(bits: u16) []const u8 {
 pub const RouteGroup = struct {
     router: *Router,
     prefix: []const u8,
+    /// Group-level middleware accumulated via `use`/`useBeforeAfter`, applied to
+    /// every route registered through this group (and inherited by subgroups).
+    /// Backed by the router's allocator; the storage is freed with the router.
+    chain: std.ArrayListUnmanaged(GroupMiddleware) = .empty,
 
-    pub fn route(self: RouteGroup, method: http.HttpMethod, path: []const u8, handler: RouteHandler) !void {
+    /// Adds a full before/after group middleware. Affects only routes
+    /// registered through this group after the call. Returns the group for
+    /// chaining.
+    pub fn use(self: *RouteGroup, middleware: GroupMiddleware) !*RouteGroup {
+        try self.chain.append(self.router.allocator, middleware);
+        return self;
+    }
+
+    /// Adds a before hook (and optional after hook) as group middleware.
+    pub fn useBeforeAfter(
+        self: *RouteGroup,
+        before: ?GroupBeforeHandler,
+        after: ?GroupAfterHandler,
+    ) !*RouteGroup {
+        return self.use(.{ .before = before, .after = after });
+    }
+
+    /// Snapshots the current middleware chain into router-owned storage so the
+    /// endpoint can borrow a stable slice independent of later `use` calls.
+    fn snapshotChain(self: *RouteGroup) ![]const GroupMiddleware {
+        if (self.chain.items.len == 0) return &.{};
+        const copy = try self.router.allocator.dupe(GroupMiddleware, self.chain.items);
+        errdefer self.router.allocator.free(copy);
+        try self.router.owned_chains.append(self.router.allocator, copy);
+        return copy;
+    }
+
+    pub fn route(self: *RouteGroup, method: http.HttpMethod, path: []const u8, handler: RouteHandler) !void {
         const joined = try joinPath(self.router.allocator, self.prefix, path);
         errdefer self.router.allocator.free(joined);
-        try self.router.route(method, joined, handler);
+        const middleware = try self.snapshotChain();
+        try self.router.routeEndpoint(method, joined, .{ .handler = handler, .middleware = middleware });
         try self.router.owned_paths.append(self.router.allocator, joined);
     }
 
-    pub fn get(self: RouteGroup, path: []const u8, handler: RouteHandler) !void {
+    pub fn get(self: *RouteGroup, path: []const u8, handler: RouteHandler) !void {
         try self.route(.get, path, handler);
     }
 
-    pub fn post(self: RouteGroup, path: []const u8, handler: RouteHandler) !void {
+    pub fn post(self: *RouteGroup, path: []const u8, handler: RouteHandler) !void {
         try self.route(.post, path, handler);
     }
 
-    pub fn put(self: RouteGroup, path: []const u8, handler: RouteHandler) !void {
+    pub fn put(self: *RouteGroup, path: []const u8, handler: RouteHandler) !void {
         try self.route(.put, path, handler);
     }
 
-    pub fn patch(self: RouteGroup, path: []const u8, handler: RouteHandler) !void {
+    pub fn patch(self: *RouteGroup, path: []const u8, handler: RouteHandler) !void {
         try self.route(.patch, path, handler);
     }
 
-    pub fn delete(self: RouteGroup, path: []const u8, handler: RouteHandler) !void {
+    pub fn delete(self: *RouteGroup, path: []const u8, handler: RouteHandler) !void {
         try self.route(.delete, path, handler);
     }
 
-    pub fn del(self: RouteGroup, path: []const u8, handler: RouteHandler) !void {
+    pub fn del(self: *RouteGroup, path: []const u8, handler: RouteHandler) !void {
         try self.delete(path, handler);
     }
 
-    pub fn head(self: RouteGroup, path: []const u8, handler: RouteHandler) !void {
+    pub fn head(self: *RouteGroup, path: []const u8, handler: RouteHandler) !void {
         try self.route(.head, path, handler);
     }
 
-    pub fn options(self: RouteGroup, path: []const u8, handler: RouteHandler) !void {
+    pub fn options(self: *RouteGroup, path: []const u8, handler: RouteHandler) !void {
         try self.route(.options, path, handler);
     }
 
-    pub fn group(self: RouteGroup, sub_prefix: []const u8) !RouteGroup {
+    /// Creates a nested subgroup. The subgroup inherits this group's prefix and
+    /// a copy of its current middleware chain; further `use` calls on either
+    /// group are independent thereafter.
+    pub fn group(self: *RouteGroup, sub_prefix: []const u8) !RouteGroup {
         const joined = try joinPath(self.router.allocator, self.prefix, sub_prefix);
         errdefer self.router.allocator.free(joined);
         try self.router.owned_paths.append(self.router.allocator, joined);
-        return .{ .router = self.router, .prefix = joined };
+        var child: std.ArrayListUnmanaged(GroupMiddleware) = .empty;
+        if (self.chain.items.len > 0) {
+            try child.appendSlice(self.router.allocator, self.chain.items);
+        }
+        return .{ .router = self.router, .prefix = joined, .chain = child };
+    }
+
+    pub fn deinit(self: *RouteGroup) void {
+        self.chain.deinit(self.router.allocator);
     }
 };
 
@@ -568,4 +676,127 @@ test "wildcard combines with leading fixed and param segments" {
     // Non-matching prefix still 404s.
     var req_nf: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/u/7/other/x", .target = "/u/7/other/x" };
     try std.testing.expectEqual(http.HttpStatus.not_found, (try router.dispatch(&req_nf)).status);
+}
+
+const GroupTrace = struct {
+    var buf: [16]u8 = undefined;
+    var len: usize = 0;
+    fn reset() void {
+        len = 0;
+    }
+    fn push(c: u8) void {
+        buf[len] = c;
+        len += 1;
+    }
+    fn slice() []const u8 {
+        return buf[0..len];
+    }
+};
+
+test "group middleware wraps only group routes (before/after order)" {
+    GroupTrace.reset();
+    var router = Router.init(std.testing.allocator);
+    defer router.deinit();
+
+    const hooks = struct {
+        fn before(_: *http.HttpRequest) anyerror!?http.HttpResponse {
+            GroupTrace.push('b');
+            return null;
+        }
+        fn after(_: *http.HttpRequest, _: *http.HttpResponse) anyerror!void {
+            GroupTrace.push('a');
+        }
+    };
+
+    var api = router.group("/api");
+    defer api.deinit();
+    _ = try api.useBeforeAfter(hooks.before, hooks.after);
+    try api.get("/users", textHandler("users"));
+
+    // A route outside the group: no group middleware runs.
+    try router.get("/public", textHandler("public"));
+
+    // Group route: before -> handler -> after.
+    var req_api: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/api/users", .target = "/api/users" };
+    try std.testing.expectEqualStrings("users", (try router.dispatch(&req_api)).body);
+    try std.testing.expectEqualStrings("ba", GroupTrace.slice());
+
+    // Non-group route: trace unchanged.
+    GroupTrace.reset();
+    var req_pub: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/public", .target = "/public" };
+    try std.testing.expectEqualStrings("public", (try router.dispatch(&req_pub)).body);
+    try std.testing.expectEqualStrings("", GroupTrace.slice());
+}
+
+test "group middleware before can short-circuit and still runs after" {
+    GroupTrace.reset();
+    var router = Router.init(std.testing.allocator);
+    defer router.deinit();
+
+    const hooks = struct {
+        fn before(_: *http.HttpRequest) anyerror!?http.HttpResponse {
+            GroupTrace.push('b');
+            return http.HttpResponse.text("blocked");
+        }
+        fn after(_: *http.HttpRequest, resp: *http.HttpResponse) anyerror!void {
+            GroupTrace.push('a');
+            try resp.setHeader("x-after", "1");
+        }
+    };
+
+    var api = router.group("/api");
+    defer api.deinit();
+    _ = try api.useBeforeAfter(hooks.before, hooks.after);
+    try api.get("/x", textHandler("never"));
+
+    var req: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/api/x", .target = "/api/x" };
+    const res = try router.dispatch(&req);
+    try std.testing.expectEqualStrings("blocked", res.body);
+    try std.testing.expectEqualStrings("1", res.header("x-after").?);
+    try std.testing.expectEqualStrings("ba", GroupTrace.slice());
+}
+
+test "nested group inherits parent middleware and adds its own" {
+    GroupTrace.reset();
+    var router = Router.init(std.testing.allocator);
+    defer router.deinit();
+
+    const hooks = struct {
+        fn outerBefore(_: *http.HttpRequest) anyerror!?http.HttpResponse {
+            GroupTrace.push('1');
+            return null;
+        }
+        fn outerAfter(_: *http.HttpRequest, _: *http.HttpResponse) anyerror!void {
+            GroupTrace.push('A');
+        }
+        fn innerBefore(_: *http.HttpRequest) anyerror!?http.HttpResponse {
+            GroupTrace.push('2');
+            return null;
+        }
+        fn innerAfter(_: *http.HttpRequest, _: *http.HttpResponse) anyerror!void {
+            GroupTrace.push('B');
+        }
+    };
+
+    var api = router.group("/api");
+    defer api.deinit();
+    _ = try api.useBeforeAfter(hooks.outerBefore, hooks.outerAfter);
+
+    var admin = try api.group("/admin");
+    defer admin.deinit();
+    _ = try admin.useBeforeAfter(hooks.innerBefore, hooks.innerAfter);
+    try admin.get("/stats", textHandler("stats"));
+
+    // Outer-only route is unaffected by the inner middleware.
+    try api.get("/ping", textHandler("ping"));
+
+    // Nested route: outer-before, inner-before, handler, inner-after, outer-after.
+    var req: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/api/admin/stats", .target = "/api/admin/stats" };
+    try std.testing.expectEqualStrings("stats", (try router.dispatch(&req)).body);
+    try std.testing.expectEqualStrings("12BA", GroupTrace.slice());
+
+    GroupTrace.reset();
+    var req_ping: http.HttpRequest = .{ .allocator = std.testing.allocator, .method = .get, .path = "/api/ping", .target = "/api/ping" };
+    try std.testing.expectEqualStrings("ping", (try router.dispatch(&req_ping)).body);
+    try std.testing.expectEqualStrings("1A", GroupTrace.slice());
 }

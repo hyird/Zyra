@@ -45,6 +45,9 @@ pub const WsHub = @import("core/ws_hub.zig").WsHub;
 pub const log = @import("core/log.zig");
 pub const Logger = @import("core/log.zig").Logger;
 pub const LogMiddleware = @import("core/log.zig").LogMiddleware;
+pub const LogChannel = @import("core/log.zig").LogChannel;
+pub const LogChannelRegistry = @import("core/log.zig").LogChannelRegistry;
+pub const LogAdmin = @import("core/log.zig").LogAdmin;
 pub const zio_backend = @import("io/zio_backend.zig");
 
 test {
