@@ -1,18 +1,18 @@
-//! Structured logging.
+//! 结构化日志。
 //!
-//! A focused, fully-implemented subset of Hical's logging stack:
+//! Hical 日志栈的一个聚焦、完整实现的子集：
 //!
-//! - `Level`        - severity levels with text labels and ordering
-//! - `Field`        - a structured key/value pair (string values)
-//! - `Sink`         - transport-agnostic line sink (function pointer + context)
-//! - `writerSink`   - adapts any `*std.Io.Writer` into a `Sink`
-//! - `Logger`       - level-filtered, structured line logger
-//! - `LogMiddleware`- context-onion middleware that logs each request's method,
-//!   path, status, and duration
+//! - `Level`        - 带文本标签和排序的严重级别
+//! - `Field`        - 一个结构化的键/值对（值为字符串）
+//! - `Sink`         - 与传输无关的行 sink（函数指针 + 上下文）
+//! - `writerSink`   - 把任意 `*std.Io.Writer` 适配为 `Sink`
+//! - `Logger`       - 按级别过滤的结构化行日志器
+//! - `LogMiddleware`- 上下文洋葱中间件，记录每个请求的 method、
+//!   path、status 和耗时
 //!
-//! Lines are formatted as:
+//! 行的格式为：
 //!   `LEVEL message key1=value1 key2=value2`
-//! Logging below the configured minimum level is skipped before any formatting.
+//! 低于配置的最低级别的日志在任何格式化之前就被跳过。
 
 const std = @import("std");
 const http = @import("http.zig");
@@ -33,8 +33,8 @@ pub const Level = enum(u8) {
         };
     }
 
-    /// Parses a level label (case-insensitive). Accepts the canonical labels
-    /// (`DEBUG`/`INFO`/`WARN`/`ERROR`) as well as the alias `WARNING`.
+    /// 解析级别标签（不区分大小写）。接受规范标签
+    /// （`DEBUG`/`INFO`/`WARN`/`ERROR`）以及别名 `WARNING`。
     pub fn fromLabel(text: []const u8) ?Level {
         if (std.ascii.eqlIgnoreCase(text, "debug")) return .debug;
         if (std.ascii.eqlIgnoreCase(text, "info")) return .info;
@@ -44,16 +44,16 @@ pub const Level = enum(u8) {
     }
 };
 
-/// A structured log field. Values are strings; format numbers with the caller's
-/// own buffer before passing them in.
+/// 一个结构化日志字段。值为字符串；数字请用调用方自己的缓冲区格式化
+/// 后再传入。
 pub const Field = struct {
     key: []const u8,
     value: []const u8,
 };
 
-/// Line sink. `write` receives a fully-formatted line WITHOUT a trailing
-/// newline; the sink decides line termination. Errors are reported back to the
-/// logger, which swallows them (logging must never crash the caller).
+/// 行 sink。`write` 收到的是一行完整格式化、但不含尾随换行的内容；
+/// 由 sink 决定行终止符。错误会回报给日志器，由其吞掉（日志绝不能让
+/// 调用方崩溃）。
 pub const Sink = struct {
     ptr: *anyopaque,
     writeFn: *const fn (*anyopaque, []const u8) anyerror!void,
@@ -63,9 +63,8 @@ pub const Sink = struct {
     }
 };
 
-/// Adapts any `*std.Io.Writer` into a `Sink`. The writer must outlive the sink.
-/// A newline is appended after each line. Note: the caller is responsible for
-/// flushing the underlying writer.
+/// 把任意 `*std.Io.Writer` 适配为 `Sink`。该 writer 的生命周期必须长于
+/// sink。每行之后追加一个换行符。注意：刷新底层 writer 由调用方负责。
 pub fn writerSink(writer: *std.Io.Writer) Sink {
     const Adapter = struct {
         fn write(ptr: *anyopaque, line: []const u8) anyerror!void {
@@ -77,28 +76,27 @@ pub fn writerSink(writer: *std.Io.Writer) Sink {
     return .{ .ptr = writer, .writeFn = Adapter.write };
 }
 
-/// A `Sink` that appends log lines to a file using the `std.Io` file API.
+/// 一个使用 `std.Io` 文件 API 把日志行追加到文件的 `Sink`。
 ///
-/// Each line is written with a trailing newline at the current end offset, so
-/// concurrent loggers writing to distinct `FileSink`s never interleave within a
-/// line. The file is created (and, by default, truncated) on `open`; pass
-/// `.{ .truncate = false }` to keep and append after any existing content.
+/// 每行在当前末尾偏移处写入并附带尾随换行，因此向不同 `FileSink` 写入的
+/// 并发日志器永远不会在一行内交错。文件在 `open` 时被创建（默认会截断）；
+/// 传入 `.{ .truncate = false }` 可保留并在已有内容之后追加。
 ///
-/// `FileSink` owns the underlying `std.Io.File` and must be closed with
-/// `close`. It must outlive any `Logger` built from its `sink()`.
+/// `FileSink` 拥有底层的 `std.Io.File`，必须用 `close` 关闭。它的生命周期
+/// 必须长于任何由其 `sink()` 构建的 `Logger`。
 pub const FileSink = struct {
     io: std.Io,
     file: std.Io.File,
     offset: u64,
 
     pub const OpenOptions = struct {
-        /// Truncate an existing file to zero length on open. When false, the
-        /// sink appends after the current contents.
+        /// 打开时把已有文件截断为零长度。为 false 时，sink 在当前内容
+        /// 之后追加。
         truncate: bool = true,
     };
 
-    /// Creates or opens `path` for appending log lines. `path` is resolved
-    /// relative to the current working directory via `std.Io.Dir.cwd()`.
+    /// 创建或打开 `path` 以追加日志行。`path` 通过 `std.Io.Dir.cwd()`
+    /// 相对于当前工作目录解析。
     pub fn open(io: std.Io, path: []const u8, options: OpenOptions) !FileSink {
         var dir = std.Io.Dir.cwd();
         const file = try dir.createFile(io, path, .{ .truncate = options.truncate });
@@ -130,19 +128,17 @@ pub const FileSink = struct {
     }
 };
 
-/// Asynchronous, batching file sink (double-buffered + background fiber).
+/// 异步、批量的文件 sink（双缓冲 + 后台 fiber）。
 ///
-/// Front-end `write` calls append the line into an in-memory buffer guarded by a
-/// `std.Io.Mutex`; a background fiber (spawned by `start`) periodically swaps the
-/// buffers and flushes the accumulated bytes to disk in one positional write.
-/// This decouples request-handling fibers from disk latency.
+/// 前端的 `write` 调用把行追加到由 `std.Io.Mutex` 保护的内存缓冲区；一个
+/// 后台 fiber（由 `start` 生成）周期性地交换缓冲区，并把累积的字节用一次
+/// 按位置写一次性刷到磁盘。这样把处理请求的 fiber 与磁盘延迟解耦。
 ///
-/// Back-pressure: when the pending buffer exceeds `backpressure_limit`, new lines
-/// are dropped and counted in `dropped` (read with `droppedCount`) instead of
-/// blocking the caller. Call `start(io)` once before logging and `stop(io)` to
-/// flush remaining data and join the background fiber. The sink binds the `io`
-/// passed to `start`; `write` uses it to lock the mutex, so all logging must
-/// happen on the same runtime.
+/// 背压：当待刷缓冲区超过 `backpressure_limit` 时，新行会被丢弃并计入
+/// `dropped`（用 `droppedCount` 读取），而不是阻塞调用方。日志前调用一次
+/// `start(io)`，结束时调用 `stop(io)` 以刷出剩余数据并 join 后台 fiber。
+/// sink 绑定传给 `start` 的 `io`；`write` 用它来锁 mutex，因此所有日志都
+/// 必须发生在同一运行时上。
 pub const AsyncFileSink = struct {
     allocator: std.mem.Allocator,
     file: FileSink,
@@ -158,14 +154,14 @@ pub const AsyncFileSink = struct {
     backpressure_limit: usize = 8 * 1024 * 1024,
 
     pub const Options = struct {
-        /// Truncate the file on open (see `FileSink.OpenOptions`).
+        /// 打开时截断文件（见 `FileSink.OpenOptions`）。
         truncate: bool = true,
         flush_interval_ms: u64 = 1000,
         backpressure_limit: usize = 8 * 1024 * 1024,
     };
 
-    /// Opens `path` and prepares an async sink. Call `start(io)` to launch the
-    /// background flusher before logging.
+    /// 打开 `path` 并准备一个异步 sink。日志前调用 `start(io)` 启动后台
+    /// 刷写器。
     pub fn open(allocator: std.mem.Allocator, io: std.Io, path: []const u8, options: Options) !AsyncFileSink {
         const file = try FileSink.open(io, path, .{ .truncate = options.truncate });
         return .{
@@ -176,28 +172,28 @@ pub const AsyncFileSink = struct {
         };
     }
 
-    /// Launches the background flush fiber. Must be called exactly once before
-    /// any logging and before `stop`.
+    /// 启动后台刷写 fiber。必须在任何日志之前、并且在 `stop` 之前恰好
+    /// 调用一次。
     pub fn start(self: *AsyncFileSink, io: std.Io) void {
         self.io = io;
         self.running.store(true, .release);
         self.group.async(io, backgroundLoop, .{self});
     }
 
-    /// Signals the background fiber to drain and exit, joins it, flushes any
-    /// residual bytes, frees buffers, and closes the file.
+    /// 通知后台 fiber 排空并退出，join 它，刷出任何残留字节，释放缓冲区，
+    /// 并关闭文件。
     pub fn stop(self: *AsyncFileSink, io: std.Io) void {
         self.running.store(false, .release);
         self.flush_event.set(io);
         self.group.await(io) catch {};
-        // Final drain of anything appended after the last loop iteration.
+        // 最终排空在最后一次循环迭代之后追加的所有内容。
         self.drainOnce(io);
         self.cur_buf.deinit(self.allocator);
         self.flush_buf.deinit(self.allocator);
         self.file.close();
     }
 
-    /// Number of lines dropped so far due to back-pressure.
+    /// 因背压而至今丢弃的行数。
     pub fn droppedCount(self: *const AsyncFileSink) u64 {
         return self.dropped.load(.acquire);
     }
@@ -222,8 +218,8 @@ pub const AsyncFileSink = struct {
         self.flush_event.set(io);
     }
 
-    /// Swaps `cur_buf` into `flush_buf` under the lock, then writes the captured
-    /// bytes to disk outside the lock so front-end writers are not blocked on I/O.
+    /// 在锁内把 `cur_buf` 换入 `flush_buf`，然后在锁外把捕获到的字节写到
+    /// 磁盘，这样前端写入者就不会因 I/O 被阻塞。
     fn drainOnce(self: *AsyncFileSink, io: std.Io) void {
         self.mutex.lockUncancelable(io);
         if (self.cur_buf.items.len == 0) {
@@ -247,8 +243,8 @@ pub const AsyncFileSink = struct {
             .clock = .awake,
         } };
         while (self.running.load(.acquire)) {
-            // Wait for either the flush interval or an explicit wake-up, then
-            // reset so the next iteration starts from a clean state.
+            // 等待刷新间隔到时或显式唤醒，然后重置，使下一轮迭代从干净
+            // 状态开始。
             self.flush_event.waitTimeout(io, timeout) catch {};
             self.flush_event.reset();
             self.drainOnce(io);
@@ -272,9 +268,9 @@ pub const Logger = struct {
         return @intFromEnum(level) >= @intFromEnum(self.min_level);
     }
 
-    /// Logs a message with optional structured fields at `level`. Formatting is
-    /// skipped entirely when `level` is below the minimum. The formatted line is
-    /// built on a fixed 1 KiB stack buffer; longer lines are truncated.
+    /// 以 `level` 记录一条带可选结构化字段的消息。当 `level` 低于最低级别
+    /// 时完全跳过格式化。格式化后的行构建在固定的 1 KiB 栈缓冲区上；更长的
+    /// 行会被截断。
     pub fn log(self: *const Logger, level: Level, message: []const u8, fields: []const Field) void {
         if (!self.enabled(level)) return;
 
@@ -306,12 +302,11 @@ pub const Logger = struct {
     }
 };
 
-/// A named logging channel with its own runtime-adjustable level and sink.
+/// 一个具名的日志通道，拥有自己的可在运行时调整的级别和 sink。
 ///
-/// Channels route categories of logs (e.g. `access`, `audit`, `perf`) to
-/// distinct destinations and let operators tune each category's verbosity
-/// independently. The level is stored atomically so it can be changed at
-/// runtime (e.g. via the log-admin endpoints) while requests are logging.
+/// 通道把不同类别的日志（如 `access`、`audit`、`perf`）路由到不同的目的地，
+/// 并让运维人员独立地调节每个类别的详尽程度。级别以原子方式存储，因此可
+/// 在请求正在记录日志时于运行时更改（例如通过 log-admin 端点）。
 pub const LogChannel = struct {
     name: []const u8,
     sink: Sink,
@@ -333,9 +328,8 @@ pub const LogChannel = struct {
         return @intFromEnum(lvl) >= self.level_raw.load(.acquire);
     }
 
-    /// Emits a structured line on this channel, filtered by the channel's
-    /// current level. Formatting matches `Logger.log` and is skipped entirely
-    /// below the threshold.
+    /// 在该通道上输出一条结构化行，按通道当前级别过滤。格式与 `Logger.log`
+    /// 一致，低于阈值时完全跳过。
     pub fn emit(self: *const LogChannel, lvl: Level, message: []const u8, fields: []const Field) void {
         if (!self.enabled(lvl)) return;
         var buf: [1024]u8 = undefined;
@@ -353,12 +347,12 @@ pub const LogChannel = struct {
     }
 };
 
-/// Thread-safe registry of named `LogChannel`s.
+/// 具名 `LogChannel` 的线程安全注册表。
 ///
-/// Channels are typically created at startup and looked up by name at runtime.
-/// The registry owns each channel (heap-allocated) and frees them on `deinit`.
-/// Channel names are duplicated into registry-owned storage. A mutex guards the
-/// map; per-channel level changes use the channel's own atomic and need no lock.
+/// 通道通常在启动时创建，并在运行时按名字查找。注册表拥有每个通道
+/// （堆分配），并在 `deinit` 时释放它们。通道名会被复制到注册表自有的
+/// 存储中。一个 mutex 保护该 map；按通道的级别更改使用通道自己的原子，
+/// 无需加锁。
 pub const LogChannelRegistry = struct {
     allocator: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
@@ -377,9 +371,8 @@ pub const LogChannelRegistry = struct {
         self.channels.deinit(self.allocator);
     }
 
-    /// Returns the existing channel named `name`, or creates one with `sink`
-    /// and `min_level`. The returned pointer is stable for the registry's
-    /// lifetime. `io` is required for mutex locking.
+    /// 返回名为 `name` 的已有通道，或用 `sink` 和 `min_level` 创建一个。
+    /// 返回的指针在注册表的生命周期内保持稳定。`io` 用于 mutex 加锁。
     pub fn getOrCreate(
         self: *LogChannelRegistry,
         io: std.Io,
@@ -401,15 +394,15 @@ pub const LogChannelRegistry = struct {
         return channel;
     }
 
-    /// Returns the channel named `name`, or null if absent.
+    /// 返回名为 `name` 的通道，不存在则返回 null。
     pub fn get(self: *LogChannelRegistry, io: std.Io, name: []const u8) ?*LogChannel {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return self.channels.get(name);
     }
 
-    /// Calls `callback(ctx, channel)` for each registered channel while holding
-    /// the registry lock. Use for read-only iteration (e.g. listing levels).
+    /// 在持有注册表锁的同时，对每个已注册通道调用 `callback(ctx, channel)`。
+    /// 用于只读遍历（例如列出各级别）。
     pub fn forEach(
         self: *LogChannelRegistry,
         io: std.Io,
@@ -426,8 +419,8 @@ pub const LogChannelRegistry = struct {
 };
 
 
-/// `attach(server)` or `server.useOnionCtx(&mw, LogMiddleware.handle)`. Logs one
-/// line per request: method, path, status, and duration in microseconds.
+/// 通过 `attach(server)` 或 `server.useOnionCtx(&mw, LogMiddleware.handle)`
+/// 注册。每个请求记录一行：method、path、status，以及以微秒计的耗时。
 pub const LogMiddleware = struct {
     logger: *const Logger,
 
@@ -470,23 +463,22 @@ pub const LogMiddleware = struct {
     }
 };
 
-/// Optional authentication check for the log-admin endpoints. Return `null` to
-/// allow the request; return a response (e.g. 401/403) to reject it.
+/// log-admin 端点的可选认证检查。返回 `null` 表示放行请求；返回一个
+/// 响应（如 401/403）则拒绝它。
 pub const AdminAuthCheck = *const fn (*http.HttpRequest) anyerror!?http.HttpResponse;
 
-/// Runtime log-level administration as a context middleware.
+/// 作为上下文中间件的运行时日志级别管理。
 ///
-/// Intercepts two endpoints under `prefix` (default `/admin`):
+/// 拦截 `prefix`（默认 `/admin`）下的两个端点：
 ///   - `GET  {prefix}/log-level`  -> JSON `{ "channels": { name: "LEVEL", ... } }`
-///   - `PUT  {prefix}/log-level`  -> body `{ "channel": "access", "level": "WARN" }`
-///     adjusts a single channel's level; responds 200 on success, 400 on bad
-///     input, 404 when the channel is unknown.
+///   - `PUT  {prefix}/log-level`  -> 请求体 `{ "channel": "access", "level": "WARN" }`
+///     调整单个通道的级别；成功响应 200，输入错误响应 400，通道未知响应 404。
 ///
-/// Requests to other paths are passed through to `next`. Register via
-/// `attach(server)` (uses `server.useOnionCtx`).
+/// 到其他路径的请求会透传给 `next`。通过 `attach(server)` 注册
+/// （使用 `server.useOnionCtx`）。
 ///
-/// WARNING: these endpoints mutate logging behavior. In production you MUST
-/// supply an `auth` check to prevent unauthorized level changes.
+/// 警告：这些端点会改变日志行为。生产环境中你必须提供一个 `auth` 检查，
+/// 以防止未授权的级别更改。
 pub const LogAdmin = struct {
     registry: *LogChannelRegistry,
     prefix: []const u8 = "/admin",
@@ -500,8 +492,8 @@ pub const LogAdmin = struct {
         try server.useOnionCtx(self, handle);
     }
 
-    /// The endpoint path this admin instance handles (`{prefix}/log-level`).
-    /// Computed on demand against a caller buffer to avoid allocation.
+    /// 该管理实例处理的端点路径（`{prefix}/log-level`）。按需针对调用方
+    /// 缓冲区计算，以避免分配。
     fn matchesPath(self: *const LogAdmin, path: []const u8) bool {
         // path == prefix ++ "/log-level"
         if (!std.mem.startsWith(u8, path, self.prefix)) return false;
@@ -569,13 +561,13 @@ pub const LogAdmin = struct {
 };
 
 // ----------------------------------------------------------------------------
-// Tests
+// 测试
 // ----------------------------------------------------------------------------
 
 
 const router_mod = @import("router.zig");
 
-/// Test sink that captures every line into an owned buffer.
+/// 把每一行都捕获进自有缓冲区的测试 sink。
 const Capture = struct {
     allocator: std.mem.Allocator,
     lines: std.ArrayListUnmanaged([]u8) = .empty,
@@ -716,11 +708,11 @@ fn fileSinkImpl(state: *FileSinkState) anyerror!void {
         defer fs.close();
         const logger = Logger.init(fs.sink(), .info);
         logger.info("first", &.{.{ .key = "n", .value = "1" }});
-        logger.debug("skipped", &.{}); // below min level
+        logger.debug("skipped", &.{}); // 低于最低级别
         logger.warn("second", &.{});
     }
 
-    // Re-open in append mode and add one more line.
+    // 以追加模式重新打开并再加一行。
     {
         var fs = try FileSink.open(io, state.path, .{ .truncate = false });
         defer fs.close();
@@ -782,8 +774,8 @@ fn asyncSinkImpl(state: *AsyncSinkState) anyerror!void {
     const logger = Logger.init(sink.sink(), .info);
     logger.info("alpha", &.{});
     logger.warn("beta", &.{});
-    logger.debug("skipped", &.{}); // below min level, never reaches the sink
-    sink.stop(io); // drains and joins the background fiber
+    logger.debug("skipped", &.{}); // 低于最低级别，永远不会到达 sink
+    sink.stop(io); // 排空并 join 后台 fiber
 
     var file = try dir.openFile(io, state.path, .{});
     defer file.close(io);
@@ -830,12 +822,12 @@ test "LogChannel filters by its own runtime-adjustable level" {
     defer cap.deinit();
 
     var channel = LogChannel.init("access", cap.sink(), .warn);
-    channel.emit(.info, "ignored", &.{}); // below level
+    channel.emit(.info, "ignored", &.{}); // 低于级别
     channel.emit(.warn, "kept", &.{.{ .key = "k", .value = "v" }});
     try std.testing.expectEqual(@as(usize, 1), cap.lines.items.len);
     try std.testing.expectEqualStrings("WARN kept k=v", cap.lines.items[0]);
 
-    // Lower the level at runtime; previously filtered level now passes.
+    // 在运行时降低级别；之前被过滤的级别现在通过了。
     channel.setLevel(.debug);
     try std.testing.expectEqual(Level.debug, channel.level());
     channel.emit(.info, "now-visible", &.{});
@@ -859,11 +851,11 @@ fn adminTestImpl(state: *AdminTestState) anyerror!void {
     var registry = LogChannelRegistry.init(alloc);
     defer registry.deinit();
 
-    // getOrCreate creates once, returns the same pointer thereafter.
+    // getOrCreate 只创建一次，之后返回同一个指针。
     const access = try registry.getOrCreate(io, "access", cap.sink(), .info);
     const access2 = try registry.getOrCreate(io, "access", cap.sink(), .err);
     try std.testing.expectEqual(access, access2);
-    try std.testing.expectEqual(Level.info, access.level()); // not overwritten
+    try std.testing.expectEqual(Level.info, access.level()); // 未被覆盖
     _ = try registry.getOrCreate(io, "audit", cap.sink(), .warn);
 
     try std.testing.expect(registry.get(io, "access") != null);
@@ -871,7 +863,7 @@ fn adminTestImpl(state: *AdminTestState) anyerror!void {
 
     var admin = LogAdmin.init(&registry);
 
-    // GET returns each channel's level as JSON.
+    // GET 以 JSON 返回每个通道的级别。
     {
         var req = http.HttpRequest.initParsed(alloc, "GET", "/admin/log-level", null, null, true);
         defer req.deinit();
@@ -887,7 +879,7 @@ fn adminTestImpl(state: *AdminTestState) anyerror!void {
         try std.testing.expectEqualStrings("WARN", channels.get("audit").?.string);
     }
 
-    // PUT adjusts a channel's level.
+    // PUT 调整某个通道的级别。
     {
         var req = http.HttpRequest.initParsed(alloc, "PUT", "/admin/log-level", "application/json", null, true);
         defer req.deinit();
@@ -900,7 +892,7 @@ fn adminTestImpl(state: *AdminTestState) anyerror!void {
         try std.testing.expectEqual(Level.err, access.level());
     }
 
-    // PUT with unknown channel -> 404.
+    // 未知通道的 PUT -> 404。
     {
         var req = http.HttpRequest.initParsed(alloc, "PUT", "/admin/log-level", "application/json", null, true);
         defer req.deinit();
@@ -912,7 +904,7 @@ fn adminTestImpl(state: *AdminTestState) anyerror!void {
         try std.testing.expectEqual(http.HttpStatus.not_found, res.status);
     }
 
-    // PUT with bad level -> 400.
+    // 级别错误的 PUT -> 400。
     {
         var req = http.HttpRequest.initParsed(alloc, "PUT", "/admin/log-level", "application/json", null, true);
         defer req.deinit();
@@ -924,7 +916,7 @@ fn adminTestImpl(state: *AdminTestState) anyerror!void {
         try std.testing.expectEqual(http.HttpStatus.bad_request, res.status);
     }
 
-    // matchesPath only matches the configured endpoint.
+    // matchesPath 只匹配配置的端点。
     try std.testing.expect(admin.matchesPath("/admin/log-level"));
     try std.testing.expect(!admin.matchesPath("/admin/other"));
     try std.testing.expect(!admin.matchesPath("/log-level"));

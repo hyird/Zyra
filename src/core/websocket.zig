@@ -1,21 +1,20 @@
-//! WebSocket protocol (RFC 6455) — pure-Zig frame codec and handshake helpers.
+//! WebSocket 协议（RFC 6455）—— 纯 Zig 帧编解码器和握手辅助函数。
 //!
-//! This module implements the parts of RFC 6455 that are self-contained and
-//! fully testable without networking:
-//!   * `computeAcceptKey` — derives the `Sec-WebSocket-Accept` value from the
-//!     client's `Sec-WebSocket-Key`.
-//!   * `Opcode` / `CloseCode` — protocol constants.
-//!   * `Frame` — decoding (with client-mask handling) and encoding of frames.
+//! 本模块实现 RFC 6455 中自包含且无需网络即可完整测试的部分：
+//!   * `computeAcceptKey` —— 从客户端的 `Sec-WebSocket-Key` 推导
+//!     `Sec-WebSocket-Accept` 值。
+//!   * `Opcode` / `CloseCode` —— 协议常量。
+//!   * `Frame` —— 帧的解码（包含客户端 mask 处理）和编码。
 //!
-//! Streaming send/receive over a connection is provided by `WebSocketSession`,
-//! which builds on the codec and reads/writes through `std.Io`.
+//! 基于连接的流式发送/接收由 `WebSocketSession` 提供；它构建于该编解码器之上，
+//! 并通过 `std.Io` 读写。
 
 const std = @import("std");
 
-/// RFC 6455 §1.3 magic GUID appended to the client key before hashing.
+/// RFC 6455 §1.3 的魔法 GUID，在哈希前追加到客户端 key 后。
 pub const guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-/// WebSocket opcodes (RFC 6455 §5.2).
+/// WebSocket 操作码（RFC 6455 §5.2）。
 pub const Opcode = enum(u4) {
     continuation = 0x0,
     text = 0x1,
@@ -30,7 +29,7 @@ pub const Opcode = enum(u4) {
     }
 };
 
-/// WebSocket close codes (RFC 6455 §7.4.1).
+/// WebSocket 关闭码（RFC 6455 §7.4.1）。
 pub const CloseCode = enum(u16) {
     normal = 1000,
     going_away = 1001,
@@ -43,12 +42,11 @@ pub const CloseCode = enum(u16) {
     _,
 };
 
-/// Default maximum message size (1 MiB) to bound memory usage.
+/// 默认最大消息大小（1 MiB），用于限制内存使用。
 pub const default_max_message_size: usize = 1024 * 1024;
 
-/// Computes the `Sec-WebSocket-Accept` header value for a given client key.
-/// Writes the base64 result into `out` (must be >= 28 bytes) and returns the
-/// written slice.
+/// 根据给定客户端 key 计算 `Sec-WebSocket-Accept` 头值。把 base64 结果写入
+/// `out`（必须 >= 28 字节），并返回写入的切片。
 pub fn computeAcceptKey(client_key: []const u8, out: *[28]u8) []const u8 {
     var sha1 = std.crypto.hash.Sha1.init(.{});
     sha1.update(client_key);
@@ -58,13 +56,12 @@ pub fn computeAcceptKey(client_key: []const u8, out: *[28]u8) []const u8 {
     return std.base64.standard.Encoder.encode(out, &digest);
 }
 
-/// A decoded WebSocket frame header plus a slice into the payload.
+/// 一个已解码的 WebSocket 帧头，以及指向负载的切片。
 pub const Frame = struct {
     fin: bool,
     rsv1: bool,
     opcode: Opcode,
-    /// Payload bytes. For decoded frames this points into a caller-provided
-    /// buffer that has already been unmasked.
+    /// 负载字节。对于解码后的帧，它指向调用方提供且已解除 mask 的缓冲区。
     payload: []const u8,
 
     pub const DecodeError = error{
@@ -72,12 +69,11 @@ pub const Frame = struct {
         PayloadTooLarge,
     };
 
-    /// Attempts to decode a single frame from `data`. On success returns the
-    /// decoded frame and the total number of bytes consumed. Masking (always
-    /// present on client->server frames) is applied in place into `data`.
+    /// 尝试从 `data` 解码单个帧。成功时返回解码后的帧和消耗的总字节数。
+    /// mask（客户端->服务端帧始终存在）会就地应用到 `data`。
     ///
-    /// Returns `error.Incomplete` if `data` does not yet contain the full
-    /// frame, and `error.PayloadTooLarge` if the payload exceeds `max_payload`.
+    /// 若 `data` 尚未包含完整帧则返回 `error.Incomplete`；若负载超过
+    /// `max_payload` 则返回 `error.PayloadTooLarge`。
     pub fn decode(data: []u8, max_payload: usize) DecodeError!struct { frame: Frame, consumed: usize } {
         if (data.len < 2) return error.Incomplete;
 
@@ -124,8 +120,8 @@ pub const Frame = struct {
         };
     }
 
-    /// Encodes a server->client frame (unmasked, per RFC 6455 §5.1) into a
-    /// freshly allocated buffer owned by the caller.
+    /// 将一个服务端->客户端帧（按 RFC 6455 §5.1，不带 mask）编码到调用方拥有的
+    /// 新分配缓冲区中。
     pub fn encode(allocator: std.mem.Allocator, opcode: Opcode, payload: []const u8, fin: bool) ![]u8 {
         const header_len: usize = if (payload.len < 126)
             2
@@ -152,22 +148,20 @@ pub const Frame = struct {
     }
 };
 
-/// A received WebSocket message with its type.
+/// 一条收到的 WebSocket 消息及其类型。
 pub const Message = struct {
     opcode: Opcode,
     data: []const u8,
 };
 
-/// A live WebSocket connection.
+/// 一个存活的 WebSocket 连接。
 ///
-/// This is a thin wrapper over the standard library's
-/// `std.http.Server.WebSocket`, which implements the RFC 6455 handshake and
-/// frame read/write. The server constructs a session after a successful
-/// upgrade and passes it to the registered handler.
+/// 这是标准库 `std.http.Server.WebSocket` 之上的一层薄包装；后者实现了
+/// RFC 6455 握手和帧读写。服务器在升级成功后构造一个 session，并传给已注册
+/// 的处理器。
 ///
-/// Note: the underlying `readMessage` requires each message to fit in the
-/// server's read buffer and does not reassemble fragmented (`fin == false`)
-/// messages.
+/// 注意：底层 `readMessage` 要求每条消息都能放入服务器读缓冲区，并且不会重组
+/// 分片（`fin == false`）消息。
 pub const WebSocketSession = struct {
     ws: *std.http.Server.WebSocket,
     open: bool = true,
@@ -175,24 +169,23 @@ pub const WebSocketSession = struct {
     pub const ReceiveError = std.http.Server.WebSocket.ReadSmallTextMessageError;
     pub const SendError = std.Io.Writer.Error;
 
-    /// Sends a UTF-8 text message.
+    /// 发送 UTF-8 文本消息。
     pub fn send(self: *WebSocketSession, text: []const u8) SendError!void {
         try self.ws.writeMessage(text, .text);
     }
 
-    /// Sends a binary message.
+    /// 发送二进制消息。
     pub fn sendBinary(self: *WebSocketSession, data: []const u8) SendError!void {
         try self.ws.writeMessage(data, .binary);
     }
 
-    /// Sends a ping frame with an optional payload (max 125 bytes).
+    /// 发送带可选负载的 ping 帧（最多 125 字节）。
     pub fn sendPing(self: *WebSocketSession, payload: []const u8) SendError!void {
         try self.ws.writeMessage(payload, .ping);
     }
 
-    /// Receives the next message. Returns `null` when the peer closes the
-    /// connection. The returned data points into the connection read buffer and
-    /// is invalidated by the next `receive` call.
+    /// 接收下一条消息。当对端关闭连接时返回 `null`。返回的数据指向连接读缓冲区，
+    /// 会在下一次 `receive` 调用时失效。
     pub fn receive(self: *WebSocketSession) ReceiveError!?Message {
         const msg = self.ws.readSmallMessage() catch |err| switch (err) {
             error.ConnectionClose => {
@@ -204,12 +197,12 @@ pub const WebSocketSession = struct {
         return .{ .opcode = stdToOpcode(msg.opcode), .data = msg.data };
     }
 
-    /// Whether the connection is still considered open.
+    /// 连接是否仍被认为处于打开状态。
     pub fn isOpen(self: *const WebSocketSession) bool {
         return self.open;
     }
 
-    /// Sends a close frame with the given code and marks the session closed.
+    /// 用给定代码发送关闭帧，并将 session 标记为已关闭。
     pub fn close(self: *WebSocketSession, code: CloseCode) SendError!void {
         var payload: [2]u8 = undefined;
         std.mem.writeInt(u16, &payload, @intFromEnum(code), .big);
@@ -231,7 +224,7 @@ fn stdToOpcode(op: std.http.Server.WebSocket.Opcode) Opcode {
 }
 
 test "computeAcceptKey matches RFC 6455 example" {
-    // RFC 6455 §1.3 worked example.
+    // RFC 6455 §1.3 中的示例。
     var out: [28]u8 = undefined;
     const accept = computeAcceptKey("dGhlIHNhbXBsZSBub25jZQ==", &out);
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", accept);
@@ -248,7 +241,7 @@ test "Opcode.isControl" {
 test "Frame.encode small text frame" {
     const buf = try Frame.encode(std.testing.allocator, .text, "Hello", true);
     defer std.testing.allocator.free(buf);
-    // FIN + text opcode, len 5, no mask, payload.
+    // FIN + 文本操作码，长度 5，无 mask，带负载。
     try std.testing.expectEqual(@as(u8, 0x81), buf[0]);
     try std.testing.expectEqual(@as(u8, 5), buf[1]);
     try std.testing.expectEqualStrings("Hello", buf[2..]);
@@ -265,7 +258,7 @@ test "Frame.encode 16-bit length" {
 }
 
 test "Frame.decode masked client frame" {
-    // Client frame for "Hi": FIN+text, masked, len 2, mask 0x37fa213d.
+    // "Hi" 的客户端帧：FIN+text，已 mask，长度 2，mask 0x37fa213d。
     var data = [_]u8{
         0x81, 0x82, 0x37, 0xfa, 0x21, 0x3d,
         0x37 ^ 'H', 0xfa ^ 'i',
@@ -283,18 +276,18 @@ test "Frame.decode reports incomplete" {
 }
 
 test "Frame.decode enforces max payload" {
-    // len7 = 5 but max is 4.
+    // len7 = 5，但最大值为 4。
     var data = [_]u8{ 0x81, 0x05, 'h', 'e', 'l', 'l', 'o' };
     try std.testing.expectError(error.PayloadTooLarge, Frame.decode(&data, 4));
 }
 
 test "encode/decode round trip" {
-    // Encode a server frame, then mask it like a client and decode it back.
+    // 编码一个服务端帧，然后像客户端一样给它加 mask 并解码回来。
     const original = "round-trip payload";
     const server = try Frame.encode(std.testing.allocator, .text, original, true);
     defer std.testing.allocator.free(server);
 
-    // Build a masked client frame from the same payload.
+    // 用同一个负载构建一个已 mask 的客户端帧。
     var client: std.ArrayListUnmanaged(u8) = .empty;
     defer client.deinit(std.testing.allocator);
     try client.append(std.testing.allocator, 0x81);
@@ -310,8 +303,8 @@ test "encode/decode round trip" {
 
 const zio = @import("zio");
 
-// End-to-end: a real WebSocket handshake + echo over a loopback connection
-// driven by the zio runtime, exercising WebSocketSession.receive/send.
+// 端到端：在回环连接上进行真实 WebSocket 握手 + echo，由 zio 运行时驱动，
+// 覆盖 WebSocketSession.receive/send。
 const E2eState = struct {
     io: std.Io,
     port: u16 = 0,
@@ -342,7 +335,7 @@ fn e2eServer(state: *E2eState, listener: *std.Io.net.Server) std.Io.Cancelable!v
 
     var session = WebSocketSession{ .ws = &socket };
     const msg = (session.receive() catch return) orelse return;
-    // Echo it straight back.
+    // 原样回显。
     session.send(msg.data) catch return;
     socket.flush() catch {};
 }
@@ -359,7 +352,7 @@ fn e2eClient(state: *E2eState) std.Io.Cancelable!void {
     var reader = stream.reader(io, &rbuf);
     var writer = stream.writer(io, &wbuf);
 
-    // Minimal WebSocket client handshake.
+    // 最小 WebSocket 客户端握手。
     const handshake =
         "GET /chat HTTP/1.1\r\n" ++
         "Host: 127.0.0.1\r\n" ++
@@ -370,7 +363,7 @@ fn e2eClient(state: *E2eState) std.Io.Cancelable!void {
     writer.interface.writeAll(handshake) catch return;
     writer.interface.flush() catch return;
 
-    // Read until end of response headers (\r\n\r\n).
+    // 读取到响应头结束（\r\n\r\n）。
     var header_buf: [1024]u8 = undefined;
     var header_len: usize = 0;
     while (header_len < header_buf.len) {
@@ -380,18 +373,18 @@ fn e2eClient(state: *E2eState) std.Io.Cancelable!void {
         if (header_len >= 4 and std.mem.eql(u8, header_buf[header_len - 4 .. header_len], "\r\n\r\n")) break;
     }
 
-    // Send a masked text frame "ping".
+    // 发送已 mask 的文本帧 "ping"。
     const payload = "ping";
     const mask = [4]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     var frame: [10]u8 = undefined;
-    frame[0] = 0x81; // FIN + text
-    frame[1] = 0x80 | @as(u8, payload.len); // masked + len
+    frame[0] = 0x81; // FIN + 文本
+    frame[1] = 0x80 | @as(u8, payload.len); // 已 mask + 长度
     @memcpy(frame[2..6], &mask);
     for (payload, 0..) |c, i| frame[6 + i] = c ^ mask[i % 4];
     writer.interface.writeAll(frame[0 .. 6 + payload.len]) catch return;
     writer.interface.flush() catch return;
 
-    // Read the echoed (unmasked) server frame.
+    // 读取回显的（未 mask）服务端帧。
     var resp: [64]u8 = undefined;
     var resp_len: usize = 0;
     while (resp_len < 6) {

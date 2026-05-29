@@ -1,29 +1,27 @@
-//! WebSocket connection hub: registry, rooms, and broadcasting.
+//! WebSocket 连接 hub：注册表、房间和广播。
 //!
-//! Mirrors Hical's `WsHub` (`add`/`remove`/`join`/`leave`/`broadcast`/
+//! 镜像 Hical 的 `WsHub`（`add`/`remove`/`join`/`leave`/`broadcast`/
 //! `broadcastBinary`/`broadcastAll`/`sendTo`/`roomSize`).
 //!
-//! The hub does not own connections; it tracks them by an assigned
-//! `ConnectionId` and routes messages through a `Sink` — a small, allocation-free
-//! interface (function pointers + context) that decouples the hub from the
-//! concrete transport. `Sink.fromSession` adapts a live
-//! `websocket.WebSocketSession`; tests use an in-memory sink. All operations are
-//! guarded by an `std.Io.Mutex`, so methods take an `io: std.Io` handle.
+//! hub 不拥有连接；它通过分配的 `ConnectionId` 跟踪连接，并通过 `Sink` 路由
+//! 消息。`Sink` 是一个小型、无分配接口（函数指针 + 上下文），把 hub 与具体
+//! 传输解耦。`Sink.fromSession` 适配一个存活的 `websocket.WebSocketSession`；
+//! 测试使用内存 sink。所有操作都由 `std.Io.Mutex` 保护，因此方法接收一个
+//! `io: std.Io` 句柄。
 
 const std = @import("std");
 const websocket = @import("websocket.zig");
 
 pub const ConnectionId = u64;
 
-/// Transport-agnostic message sink. Holds an opaque context and two send
-/// functions. Send errors are swallowed by the hub during broadcast (a broken
-/// peer must not abort delivery to the rest of the room).
+/// 与传输无关的消息 sink。持有一个不透明上下文和两个发送函数。广播时发送
+/// 错误会被 hub 吞掉（坏掉的 peer 不能中止向房间其余成员的投递）。
 pub const Sink = struct {
     ptr: *anyopaque,
     send_text: *const fn (*anyopaque, []const u8) anyerror!void,
     send_binary: *const fn (*anyopaque, []const u8) anyerror!void,
 
-    /// Adapts a live WebSocket session into a sink.
+    /// 把一个存活的 WebSocket 会话适配为 sink。
     pub fn fromSession(session: *websocket.WebSocketSession) Sink {
         const Adapter = struct {
             fn text(ptr: *anyopaque, msg: []const u8) anyerror!void {
@@ -58,7 +56,7 @@ pub const WsHub = struct {
     allocator: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
     connections: std.AutoHashMapUnmanaged(ConnectionId, Connection) = .empty,
-    /// room name -> set of member connection ids
+    /// 房间名 -> 成员连接 id 集合
     rooms: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(ConnectionId, void)) = .empty,
     next_id: ConnectionId = 1,
 
@@ -87,7 +85,7 @@ pub const WsHub = struct {
         conn.rooms.deinit(self.allocator);
     }
 
-    /// Registers a connection and returns its assigned id.
+    /// 注册一个连接并返回分配给它的 id。
     pub fn add(self: *WsHub, io: std.Io, sink: Sink) !ConnectionId {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -97,7 +95,7 @@ pub const WsHub = struct {
         return id;
     }
 
-    /// Removes a connection from the hub and every room it belongs to.
+    /// 从 hub 及其所属的每个房间中移除一个连接。
     pub fn remove(self: *WsHub, io: std.Io, id: ConnectionId) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -111,16 +109,15 @@ pub const WsHub = struct {
         _ = self.connections.remove(id);
     }
 
-    /// Adds a connection to a room (creating the room if needed). No-op if the
-    /// connection id is unknown.
+    /// 把一个连接加入房间（必要时创建房间）。若连接 id 未知则不执行任何操作。
     pub fn join(self: *WsHub, io: std.Io, id: ConnectionId, room: []const u8) !void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
 
         const conn = self.connections.getPtr(id) orelse return;
 
-        // Ensure the room exists and obtain the owned room-name key, which both
-        // the room map and the connection's room set will reference.
+        // 确保房间存在，并取得自有的房间名 key；房间 map 和连接的房间集合都会
+        // 引用它。
         const room_gop = try self.rooms.getOrPut(self.allocator, room);
         if (!room_gop.found_existing) {
             const owned = self.allocator.dupe(u8, room) catch |err| {
@@ -136,7 +133,7 @@ pub const WsHub = struct {
         try room_gop.value_ptr.put(self.allocator, id, {});
     }
 
-    /// Removes a connection from a room.
+    /// 从房间中移除一个连接。
     pub fn leave(self: *WsHub, io: std.Io, id: ConnectionId, room: []const u8) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -157,13 +154,12 @@ pub const WsHub = struct {
         }
     }
 
-    /// Sends a text message to every member of `room`, optionally skipping
-    /// `exclude` (pass 0 to exclude nobody).
+    /// 向 `room` 的每个成员发送文本消息，可选择跳过 `exclude`（传 0 表示不跳过）。
     pub fn broadcast(self: *WsHub, io: std.Io, room: []const u8, message: []const u8, exclude: ConnectionId) void {
         self.broadcastImpl(io, room, message, exclude, false);
     }
 
-    /// Sends a binary message to every member of `room`.
+    /// 向 `room` 的每个成员发送二进制消息。
     pub fn broadcastBinary(self: *WsHub, io: std.Io, room: []const u8, data: []const u8, exclude: ConnectionId) void {
         self.broadcastImpl(io, room, data, exclude, true);
     }
@@ -183,7 +179,7 @@ pub const WsHub = struct {
         }
     }
 
-    /// Sends a text message to every registered connection.
+    /// 向每个已注册连接发送文本消息。
     pub fn broadcastAll(self: *WsHub, io: std.Io, message: []const u8, exclude: ConnectionId) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -194,7 +190,7 @@ pub const WsHub = struct {
         }
     }
 
-    /// Sends a text message to a single connection by id.
+    /// 按 id 向单个连接发送文本消息。
     pub fn sendTo(self: *WsHub, io: std.Io, id: ConnectionId, message: []const u8) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -203,7 +199,7 @@ pub const WsHub = struct {
         }
     }
 
-    /// Number of members currently in `room`.
+    /// `room` 中当前的成员数。
     pub fn roomSize(self: *WsHub, io: std.Io, room: []const u8) usize {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -211,7 +207,7 @@ pub const WsHub = struct {
         return members.count();
     }
 
-    /// Number of registered connections.
+    /// 已注册连接数。
     pub fn connectionCount(self: *WsHub, io: std.Io) usize {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -220,7 +216,7 @@ pub const WsHub = struct {
 };
 
 // ----------------------------------------------------------------------------
-// Tests (driven by a single-threaded zio runtime, since std.Io.Mutex needs io)
+// 测试（由单线程 zio 运行时驱动，因为 std.Io.Mutex 需要 io）
 // ----------------------------------------------------------------------------
 
 const zio = @import("zio");
@@ -252,7 +248,7 @@ fn runOnIo(comptime func: anytype) !void {
     try result.check();
 }
 
-/// In-memory sink that records every message it receives, for assertions.
+/// 内存 sink，记录收到的每条消息以便断言。
 const Recorder = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayListUnmanaged([]u8) = .empty,
@@ -324,7 +320,7 @@ test "join and roomSize track membership" {
             try hub.join(io, b, "lobby");
             try std.testing.expectEqual(@as(usize, 2), hub.roomSize(io, "lobby"));
 
-            // Joining twice is idempotent.
+            // 加入两次是幂等的。
             try hub.join(io, a, "lobby");
             try std.testing.expectEqual(@as(usize, 2), hub.roomSize(io, "lobby"));
 
@@ -352,9 +348,9 @@ test "broadcast delivers to room members except excluded" {
             const c = try hub.add(io, r3.sink());
             try hub.join(io, a, "room");
             try hub.join(io, b, "room");
-            // c is not in the room.
+            // c 不在房间中。
 
-            hub.broadcast(io, "room", "hello", a); // exclude the sender
+            hub.broadcast(io, "room", "hello", a); // 排除发送者
 
             try std.testing.expectEqual(@as(usize, 0), r1.messages.items.len);
             try std.testing.expectEqualStrings("hello", r2.last().?);
@@ -420,7 +416,7 @@ test "remove evicts connection from its rooms" {
             try std.testing.expectEqual(@as(usize, 1), hub.roomSize(io, "room"));
 
             hub.remove(io, a);
-            // Empty room is cleaned up.
+            // 空房间会被清理。
             try std.testing.expectEqual(@as(usize, 0), hub.roomSize(io, "room"));
             try std.testing.expectEqual(@as(usize, 0), hub.connectionCount(io));
         }

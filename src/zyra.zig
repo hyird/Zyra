@@ -1,8 +1,7 @@
-//! Zyra: a Zig 0.16 + std.Io + zio web framework.
+//! Zyra：一个 Zig 0.16 + std.Io + zio Web 框架。
 //!
-//! The public surface mirrors Hical's architecture: `HttpServer`, `Router`,
-//! `MiddlewarePipeline`, request/response types, a zio-backed I/O adapter, and
-//! request-scoped arena allocation.
+//! 公共表面镜像 Hical 的架构：`HttpServer`、`Router`、`MiddlewarePipeline`、
+//! 请求/响应类型、基于 zio 的 I/O 适配器，以及请求作用域的 arena 分配。
 
 pub const http = @import("core/http.zig");
 pub const HttpMethod = http.HttpMethod;

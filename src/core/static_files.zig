@@ -390,12 +390,12 @@ pub const StaticFiles = struct {
                         try res.setHeader("x-content-type-options", "nosniff");
                         return res;
                     },
-                    .none, .multi => {}, // fall through to full response
+                    .none, .multi => {}, // 落到完整响应
                 }
             }
         }
 
-        // Full 200 response, streamed from disk in chunks (constant memory).
+        // 完整的 200 响应，从磁盘分块流式传输（常量内存）。
         var res = http.HttpResponse.fileBody(.ok, mime, disk_path, 0, file_size);
         try res.setHeader("accept-ranges", "bytes");
         try res.setHeader("etag", etag_owned);
@@ -473,7 +473,7 @@ fn smokeRun(state: *SmokeState) std.Io.Cancelable!void {
 fn smokeImpl(state: *SmokeState) anyerror!void {
     const io = state.io;
 
-    // Create a temp dir + file using the same std.Io backend serve() reads.
+    // 用与 serve() 读取时相同的 std.Io 后端创建临时目录 + 文件。
     var cwd = std.Io.Dir.cwd();
     cwd.deleteTree(io, state.dir) catch {};
     try cwd.createDirPath(io, state.dir);
@@ -481,7 +481,7 @@ fn smokeImpl(state: *SmokeState) anyerror!void {
 
     const file_rel = try std.fmt.allocPrint(state.arena, "{s}/hello.txt", .{state.dir});
     {
-        // zio's std.Io backend supports positional file writes (not streaming).
+        // zio 的 std.Io 后端支持按位置写文件（非流式）。
         var f = try cwd.createFile(io, file_rel, .{});
         defer f.close(io);
         try f.writePositionalAll(io, "Hello, Zyra!", 0);
@@ -489,7 +489,7 @@ fn smokeImpl(state: *SmokeState) anyerror!void {
 
     const sf = StaticFiles.init(state.dir, "/static/");
 
-    // Full 200 response.
+    // 完整的 200 响应。
     var req_full = http.HttpRequest{
         .allocator = state.arena,
         .method = .get,
@@ -505,7 +505,7 @@ fn smokeImpl(state: *SmokeState) anyerror!void {
     }
     state.full_etag = full.header("etag") orelse "";
 
-    // 304 Not Modified using the returned ETag.
+    // 使用返回的 ETag 触发 304 Not Modified。
     var req_nm = http.HttpRequest{
         .allocator = state.arena,
         .method = .get,
@@ -517,7 +517,7 @@ fn smokeImpl(state: *SmokeState) anyerror!void {
     const nm = try sf.serve(&req_nm);
     state.notmod_status = nm.status;
 
-    // 206 Partial Content via Range.
+    // 通过 Range 触发 206 Partial Content。
     var req_rg = http.HttpRequest{
         .allocator = state.arena,
         .method = .get,
@@ -534,7 +534,7 @@ fn smokeImpl(state: *SmokeState) anyerror!void {
     }
     state.range_content_range_present = rg.content_range_len > 0;
 
-    // 404 for a missing file.
+    // 缺失文件返回 404。
     var req_nf = http.HttpRequest{
         .allocator = state.arena,
         .method = .get,
@@ -545,7 +545,7 @@ fn smokeImpl(state: *SmokeState) anyerror!void {
     const nf = try sf.serve(&req_nf);
     state.notfound_status = nf.status;
 
-    // Cached StaticFiles: two requests for the same path; the second is a hit.
+    // 带缓存的 StaticFiles：对同一路径发两次请求；第二次命中缓存。
     var sf_cached = try StaticFiles.initCached(state.arena, state.dir, "/static/");
     defer sf_cached.deinit(state.arena);
 
@@ -556,7 +556,7 @@ fn smokeImpl(state: *SmokeState) anyerror!void {
         .target = "/static/hello.txt",
         .io = state.io,
     };
-    _ = try sf_cached.serve(&req_c1); // populates the cache
+    _ = try sf_cached.serve(&req_c1); // 填充缓存
 
     var req_c2 = http.HttpRequest{
         .allocator = state.arena,
@@ -565,7 +565,7 @@ fn smokeImpl(state: *SmokeState) anyerror!void {
         .target = "/static/hello.txt",
         .io = state.io,
     };
-    const c2 = try sf_cached.serve(&req_c2); // cache hit
+    const c2 = try sf_cached.serve(&req_c2); // 缓存命中
     state.cache_hit_status = c2.status;
     if (c2.file) |fb| state.cache_hit_len = fb.length;
     state.cache_entries = sf_cached.cache.?.map.count();
@@ -607,7 +607,7 @@ test "static files end-to-end serve 200 304 206 404" {
 
     try std.testing.expectEqual(http.HttpStatus.not_found, state.notfound_status);
 
-    // Cached path: hit returns the same file length and leaves one cache entry.
+    // 缓存路径：命中返回相同的文件长度，并留下一个缓存条目。
     try std.testing.expectEqual(http.HttpStatus.ok, state.cache_hit_status);
     try std.testing.expectEqual(@as(u64, 12), state.cache_hit_len);
     try std.testing.expectEqual(@as(usize, 1), state.cache_entries);

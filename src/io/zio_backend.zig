@@ -1,8 +1,7 @@
-//! zio-backed adapter layer.
+//! 基于 zio 的适配层。
 //!
-//! The framework uses zio only to create a `std.Io` implementation. HTTP code
-//! consumes `std.Io.net`, `std.Io.Reader`, and `std.Io.Writer` instead of
-//! calling zio networking APIs directly.
+//! 框架仅使用 zio 创建一个 `std.Io` 实现。HTTP 代码消费 `std.Io.net`、
+//! `std.Io.Reader` 和 `std.Io.Writer`，而不是直接调用 zio 网络 API。
 
 pub const zio = @import("zio");
 pub const Runtime = zio.Runtime;

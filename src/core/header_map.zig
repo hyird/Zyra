@@ -1,15 +1,13 @@
-//! Case-insensitive, multi-value HTTP header container.
+//! 大小写不敏感、多值 HTTP 头容器。
 //!
-//! Mirrors Hical's `HeaderMap`: entries are stored in insertion order in a flat
-//! list of `(name, value)` pairs. HTTP messages rarely carry more than ~20
-//! headers, so a linear scan stays inside the L1 cache and avoids the hashing
-//! and pointer-chasing overhead of a hash map. Names are compared
-//! case-insensitively (`std.ascii.eqlIgnoreCase`).
+//! 镜像 Hical 的 `HeaderMap`：条目按插入顺序存储在扁平的 `(name, value)` 对列表中。
+//! HTTP 消息很少携带超过约 20 个头，因此线性扫描仍停留在 L1 缓存内，并避免哈希
+//! map 的哈希和指针追逐开销。名称按大小写不敏感方式比较
+//! （`std.ascii.eqlIgnoreCase`）。
 //!
-//! The container does NOT own the `name`/`value` byte slices; callers must keep
-//! the backing storage alive for the lifetime of the map (typically a
-//! request-scoped arena). Only the entry list itself is heap-allocated through
-//! the provided allocator.
+//! 该容器不拥有 `name`/`value` 字节切片；调用方必须在 map 的生命周期内保持其后备
+//! 存储存活（通常是请求作用域 arena）。只有条目列表本身会通过提供的分配器在堆上
+//! 分配。
 
 const std = @import("std");
 
@@ -31,12 +29,12 @@ pub const HeaderMap = struct {
         self.* = undefined;
     }
 
-    /// Case-insensitive name equality (ASCII).
+    /// 大小写不敏感的名称相等判断（ASCII）。
     pub fn iequals(a: []const u8, b: []const u8) bool {
         return std.ascii.eqlIgnoreCase(a, b);
     }
 
-    /// Returns the value of the first header matching `name`, or null.
+    /// 返回第一个匹配 `name` 的头值；没有则返回 null。
     pub fn find(self: *const HeaderMap, name: []const u8) ?[]const u8 {
         for (self.entries.items) |entry| {
             if (iequals(entry.name, name)) return entry.value;
@@ -44,8 +42,7 @@ pub const HeaderMap = struct {
         return null;
     }
 
-    /// Overwrites the first header matching `name`, or appends a new entry when
-    /// none exists. Use this for single-value headers.
+    /// 覆盖第一个匹配 `name` 的头；若不存在则追加新条目。用于单值头。
     pub fn set(self: *HeaderMap, name: []const u8, value: []const u8) !void {
         for (self.entries.items) |*entry| {
             if (iequals(entry.name, name)) {
@@ -56,13 +53,12 @@ pub const HeaderMap = struct {
         try self.entries.append(self.allocator, .{ .name = name, .value = value });
     }
 
-    /// Always appends a new entry, preserving any existing values. Use this for
-    /// multi-value headers such as `Set-Cookie`.
+    /// 始终追加新条目，保留任何已有值。用于 `Set-Cookie` 等多值头。
     pub fn insert(self: *HeaderMap, name: []const u8, value: []const u8) !void {
         try self.entries.append(self.allocator, .{ .name = name, .value = value });
     }
 
-    /// Removes every header matching `name`. Returns the number removed.
+    /// 移除每个匹配 `name` 的头。返回移除数量。
     pub fn erase(self: *HeaderMap, name: []const u8) usize {
         var write_index: usize = 0;
         const list = self.entries.items;
@@ -77,12 +73,12 @@ pub const HeaderMap = struct {
         return removed;
     }
 
-    /// Returns true when at least one header matches `name`.
+    /// 当至少一个头匹配 `name` 时返回 true。
     pub fn contains(self: *const HeaderMap, name: []const u8) bool {
         return self.find(name) != null;
     }
 
-    /// Counts the headers matching `name`.
+    /// 统计匹配 `name` 的头数量。
     pub fn count(self: *const HeaderMap, name: []const u8) usize {
         var n: usize = 0;
         for (self.entries.items) |entry| {
@@ -91,14 +87,14 @@ pub const HeaderMap = struct {
         return n;
     }
 
-    /// Appends every value matching `name` to `out` (in insertion order).
+    /// 将每个匹配 `name` 的值追加到 `out`（按插入顺序）。
     pub fn findAll(self: *const HeaderMap, name: []const u8, out: *std.ArrayListUnmanaged([]const u8), allocator: std.mem.Allocator) !void {
         for (self.entries.items) |entry| {
             if (iequals(entry.name, name)) try out.append(allocator, entry.value);
         }
     }
 
-    /// Total number of stored entries (across all names).
+    /// 已存储条目的总数（跨所有名称）。
     pub fn size(self: *const HeaderMap) usize {
         return self.entries.items.len;
     }
@@ -107,24 +103,24 @@ pub const HeaderMap = struct {
         return self.entries.items.len == 0;
     }
 
-    /// Pre-reserves capacity for `n` entries.
+    /// 为 `n` 个条目预留容量。
     pub fn reserve(self: *HeaderMap, n: usize) !void {
         try self.entries.ensureTotalCapacity(self.allocator, n);
     }
 
-    /// Removes all entries, keeping allocated capacity.
+    /// 移除所有条目，保留已分配容量。
     pub fn clear(self: *HeaderMap) void {
         self.entries.clearRetainingCapacity();
     }
 
-    /// Borrows the underlying entry slice for iteration.
+    /// 借用底层条目切片以供迭代。
     pub fn items(self: *const HeaderMap) []const Entry {
         return self.entries.items;
     }
 };
 
 // ----------------------------------------------------------------------------
-// Tests
+// 测试
 // ----------------------------------------------------------------------------
 
 test "iequals compares names case-insensitively" {
@@ -139,7 +135,7 @@ test "set overwrites first match and find is case-insensitive" {
     defer map.deinit();
 
     try map.set("Content-Type", "text/plain");
-    try map.set("content-type", "application/json"); // overwrites existing
+    try map.set("content-type", "application/json"); // 覆盖已有值
 
     try std.testing.expectEqual(@as(usize, 1), map.size());
     try std.testing.expectEqualStrings("application/json", map.find("CONTENT-TYPE").?);

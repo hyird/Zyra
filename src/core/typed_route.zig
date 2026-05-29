@@ -1,34 +1,30 @@
-//! Typed route handlers: compile-time trampolines that let handlers accept a
-//! strongly-typed JSON request body and return a strongly-typed value, while
-//! still registering as a plain `RouteHandler` on the router.
+//! 类型化路由处理器：编译期 trampoline，使处理器可以接收强类型 JSON 请求体并
+//! 返回强类型值，同时仍作为普通 `RouteHandler` 注册到路由器上。
 //!
-//! A typed handler has one of two shapes:
-//!   * `fn(*HttpRequest, Body) E!Response` — JSON body parsed into `Body`,
-//!     return value serialized as a JSON response.
-//!   * `fn(*HttpRequest) E!Response`        — no request body; return value
-//!     serialized as a JSON response.
+//! 类型化处理器有两种形状：
+//!   * `fn(*HttpRequest, Body) E!Response` —— JSON body 解析为 `Body`，
+//!     返回值序列化为 JSON 响应。
+//!   * `fn(*HttpRequest) E!Response`        —— 无请求体；返回值序列化为 JSON 响应。
 //!
-//! In both cases `Response` may be `void` (empty 200 response). The body and
-//! response types are recovered at compile time so the same information can feed
-//! OpenAPI schema reflection. The generated trampoline is a concrete
-//! `fn(*HttpRequest) anyerror!HttpResponse`, so there is no runtime dispatch
-//! overhead beyond the work a hand-written handler would already perform
-//! (`readJson` + `jsonResponse`).
+//! 两种情况下 `Response` 都可以是 `void`（空 200 响应）。请求体和响应类型会在
+//! 编译期恢复，因此同一份信息也能供 OpenAPI schema 反射使用。生成的 trampoline
+//! 是具体的 `fn(*HttpRequest) anyerror!HttpResponse`，因此除了手写处理器本来就会
+//! 执行的工作（`readJson` + `jsonResponse`）之外，没有运行时分发开销。
 
 const std = @import("std");
 const http = @import("http.zig");
 const router = @import("router.zig");
 
-/// Compile-time description of a typed handler's request/response types.
-/// `Body == void` means the handler takes no JSON request body.
-/// `Response == void` means the handler returns an empty response.
+/// 类型化处理器请求/响应类型的编译期描述。
+/// `Body == void` 表示处理器不接收 JSON 请求体。
+/// `Response == void` 表示处理器返回空响应。
 pub const TypedInfo = struct {
     Body: type,
     Response: type,
 };
 
-/// Reflects a typed handler function, returning its request/response types.
-/// Triggers a `@compileError` if the handler does not match a supported shape.
+/// 反射一个类型化处理器函数，返回其请求/响应类型。若处理器不匹配受支持形状，
+/// 则触发 `@compileError`。
 pub fn infoOf(comptime handler: anytype) TypedInfo {
     const H = @TypeOf(handler);
     const info = @typeInfo(H);
@@ -57,8 +53,8 @@ pub fn infoOf(comptime handler: anytype) TypedInfo {
     return .{ .Body = Body, .Response = Response };
 }
 
-/// Extracts the success payload type from a handler's return type. Accepts an
-/// error union (`E!T`) or a plain value type (`T`); `T` may be `void`.
+/// 从处理器返回类型中提取成功负载类型。接受错误联合（`E!T`）或普通值类型
+/// （`T`）；`T` 可以是 `void`。
 fn ResponsePayload(comptime Ret: type) type {
     return switch (@typeInfo(Ret)) {
         .error_union => |eu| eu.payload,
@@ -66,10 +62,9 @@ fn ResponsePayload(comptime Ret: type) type {
     };
 }
 
-/// Generates a plain `RouteHandler` trampoline for a typed handler. The
-/// trampoline parses the JSON body (when the handler takes one), invokes the
-/// handler, and serializes the result as a JSON response (or an empty 200 when
-/// the response type is `void`).
+/// 为类型化处理器生成一个普通 `RouteHandler` trampoline。该 trampoline 会解析
+/// JSON body（当处理器接收 body 时）、调用处理器，并把结果序列化为 JSON 响应
+/// （当响应类型为 `void` 时则为空 200）。
 pub fn wrap(comptime handler: anytype) router.RouteHandler {
     const ti = comptime infoOf(handler);
     const Body = ti.Body;
@@ -94,7 +89,7 @@ pub fn wrap(comptime handler: anytype) router.RouteHandler {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// 测试
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;

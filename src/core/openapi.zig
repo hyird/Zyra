@@ -1,9 +1,8 @@
-//! OpenAPI 3.0.3 document generation.
+//! OpenAPI 3.0.3 文档生成。
 //!
-//! `OpenApiDocument` collects registered operations (HTTP method, path,
-//! optional summary) and emits a valid OpenAPI 3.0.3 JSON document. Path
-//! parameters written as `{name}` are surfaced as required path parameters.
-//! The generated JSON is produced with `std.json` and is owned by the caller.
+//! `OpenApiDocument` 收集已注册操作（HTTP 方法、路径、可选摘要），并输出有效的
+//! OpenAPI 3.0.3 JSON 文档。写作 `{name}` 的路径参数会作为必需路径参数暴露。
+//! 生成的 JSON 使用 `std.json` 产生，并由调用方拥有。
 
 const std = @import("std");
 const http = @import("http.zig");
@@ -14,11 +13,10 @@ pub const Operation = struct {
     method: http.HttpMethod,
     path: []const u8,
     summary: []const u8 = "",
-    /// Pre-rendered JSON Schema for the request body (owned by the document),
-    /// or null when the operation takes no JSON body.
+    /// 请求体的预渲染 JSON Schema（由文档拥有）；当操作没有 JSON 请求体时为 null。
     request_schema: ?[]const u8 = null,
-    /// Pre-rendered JSON Schema for the 200 response body (owned by the
-    /// document), or null when the response has no documented schema.
+    /// 200 响应体的预渲染 JSON Schema（由文档拥有）；当响应没有已记录 schema 时为
+    /// null。
     response_schema: ?[]const u8 = null,
 };
 
@@ -51,22 +49,21 @@ pub const OpenApiDocument = struct {
         self.operations.deinit(self.allocator);
     }
 
-    /// Registers an operation. `summary` may be empty.
+    /// 注册一个操作。`summary` 可以为空。
     pub fn addOperation(self: *OpenApiDocument, method: http.HttpMethod, path: []const u8, summary: []const u8) !void {
         try self.operations.append(self.allocator, .{ .method = method, .path = path, .summary = summary });
     }
 
-    /// Options for `addJsonOperation`. `Request`/`Response` are Zig types whose
-    /// JSON Schema is reflected at compile time; leave them as the default
-    /// `null` (i.e. omit) when the operation has no JSON request/response body.
+    /// `addJsonOperation` 的选项。`Request`/`Response` 是在编译期反射为 JSON
+    /// Schema 的 Zig 类型；当操作没有 JSON 请求/响应体时，保持默认的 `null`
+    /// （即省略）。
     pub const JsonOperationOptions = struct {
         summary: []const u8 = "",
     };
 
-    /// Registers an operation whose request and/or response bodies are described
-    /// by reflecting the given Zig types into inline JSON Schemas. Pass the
-    /// types via the `Request`/`Response` comptime parameters; use `void` to
-    /// indicate "no body". The rendered schemas are owned by the document.
+    /// 注册一个操作，其请求体和/或响应体通过把给定 Zig 类型反射为内联 JSON Schema
+    /// 来描述。通过 `Request`/`Response` 编译期参数传入类型；用 `void` 表示
+    /// “无 body”。渲染出的 schema 由文档拥有。
     pub fn addJsonOperation(
         self: *OpenApiDocument,
         comptime Request: type,
@@ -96,17 +93,14 @@ pub const OpenApiDocument = struct {
         });
     }
 
-    /// Collects every HTTP route registered on `router` as an operation
-    /// (without summaries). Path strings are borrowed from the router and must
-    /// outlive document generation. Routes already present (matched by method
-    /// and path) are skipped, so schemas added beforehand (e.g. via
-    /// `addJsonOperation`) are preserved.
+    /// 将 `router` 上注册的每条 HTTP 路由收集为一个操作（不带摘要）。路径字符串
+    /// 从 router 借用，生命周期必须长于文档生成。已存在的路由（按 method 和 path
+    /// 匹配）会被跳过，因此之前添加的 schema（例如通过 `addJsonOperation`）会保留。
     pub fn collectFromRouter(self: *OpenApiDocument, router: *const Router) !void {
         try router.forEachRoute(self, collectCallback);
     }
 
-    /// Returns true if an operation with the given method and path is already
-    /// registered.
+    /// 若已注册给定 method 和 path 的操作，则返回 true。
     pub fn hasOperation(self: *const OpenApiDocument, method: http.HttpMethod, path: []const u8) bool {
         for (self.operations.items) |op| {
             if (op.method == method and std.mem.eql(u8, op.path, path)) return true;
@@ -119,8 +113,7 @@ pub const OpenApiDocument = struct {
         try self.addOperation(method, path, "");
     }
 
-    /// Generates the OpenAPI JSON document. The returned slice is owned by the
-    /// caller and allocated from the document's allocator.
+    /// 生成 OpenAPI JSON 文档。返回的切片由调用方拥有，并从文档的分配器分配。
     pub fn generate(self: *const OpenApiDocument) ![]const u8 {
         var out = std.Io.Writer.Allocating.init(self.allocator);
         errdefer out.deinit();
@@ -170,7 +163,7 @@ pub const OpenApiDocument = struct {
     fn writePaths(self: *const OpenApiDocument, w: *std.json.Stringify) !void {
         try w.beginObject();
 
-        // Group operations by path, preserving first-seen order.
+        // 按路径分组操作，保留首次出现的顺序。
         var seen_paths: std.ArrayListUnmanaged([]const u8) = .empty;
         defer seen_paths.deinit(self.allocator);
 
@@ -200,7 +193,7 @@ pub const OpenApiDocument = struct {
             try w.write(op.summary);
         }
 
-        // Path parameters from {name} segments.
+        // 来自 {name} 段的路径参数。
         var has_params = false;
         var it = pathParamIterator(op.path);
         while (it.next()) |_| {
@@ -229,7 +222,7 @@ pub const OpenApiDocument = struct {
             try w.endArray();
         }
 
-        // Request body schema, when the operation documents one.
+        // 当操作记录了请求体时写入请求体 schema。
         if (op.request_schema) |req_schema| {
             try w.objectField("requestBody");
             try w.beginObject();
@@ -277,8 +270,7 @@ fn renderSchema(allocator: std.mem.Allocator, comptime T: type) ![]const u8 {
     return out.toOwnedSlice();
 }
 
-/// Emits a pre-rendered JSON value (e.g. a reflected schema) as a raw value at
-/// the current position in the stringifier.
+/// 在 stringifier 的当前位置把预渲染 JSON 值（例如反射出的 schema）作为原始值输出。
 fn writeRawJson(w: *std.json.Stringify, raw: []const u8) !void {
     try w.beginWriteRaw();
     try w.writer.writeAll(raw);
@@ -347,7 +339,7 @@ test "generate emits valid openapi document" {
 
     const json = try doc.generate();
 
-    // Must be parseable and contain expected fields.
+    // 必须可解析并包含预期字段。
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
@@ -436,7 +428,7 @@ test "addJsonOperation reflects request and response schemas" {
     var doc = OpenApiDocument.init(a, .{ .title = "Schema API" });
     defer doc.deinit();
     try doc.addJsonOperation(CreateUser, User, .post, "/users", .{ .summary = "Create user" });
-    // Response-only operation (no request body).
+    // 仅响应操作（无请求体）。
     try doc.addJsonOperation(void, User, .get, "/users/{id}", .{});
 
     const json = try doc.generate();
@@ -445,7 +437,7 @@ test "addJsonOperation reflects request and response schemas" {
 
     const paths = parsed.value.object.get("paths").?.object;
 
-    // POST /users: requestBody schema reflected from CreateUser.
+    // POST /users：从 CreateUser 反射出的 requestBody schema。
     const post = paths.get("/users").?.object.get("post").?.object;
     try std.testing.expectEqualStrings("Create user", post.get("summary").?.string);
     const req_schema = post.get("requestBody").?.object
@@ -456,12 +448,12 @@ test "addJsonOperation reflects request and response schemas" {
     const req_props = req_schema.get("properties").?.object;
     try std.testing.expectEqualStrings("string", req_props.get("name").?.object.get("type").?.string);
     try std.testing.expect(req_props.get("age").?.object.get("nullable").?.bool);
-    // Only `name` is required (age is optional).
+    // 只有 `name` 是必需字段（age 是可选字段）。
     const req_required = req_schema.get("required").?.array;
     try std.testing.expectEqual(@as(usize, 1), req_required.items.len);
     try std.testing.expectEqualStrings("name", req_required.items[0].string);
 
-    // POST /users: 200 response schema reflected from User.
+    // POST /users：从 User 反射出的 200 响应 schema。
     const post_resp = post.get("responses").?.object.get("200").?.object;
     const resp_schema = post_resp.get("content").?.object
         .get("application/json").?.object
@@ -469,7 +461,7 @@ test "addJsonOperation reflects request and response schemas" {
     const resp_props = resp_schema.get("properties").?.object;
     try std.testing.expectEqualStrings("integer", resp_props.get("id").?.object.get("type").?.string);
 
-    // GET /users/{id}: no requestBody, but a response schema.
+    // GET /users/{id}：没有 requestBody，但有响应 schema。
     const get = paths.get("/users/{id}").?.object.get("get").?.object;
     try std.testing.expect(get.get("requestBody") == null);
     try std.testing.expect(get.get("responses").?.object

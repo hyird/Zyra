@@ -1,36 +1,32 @@
-//! In-memory session management.
+//! 内存会话管理。
 //!
-//! Mirrors Hical's `Session` / `SessionManager` / `makeSessionMiddleware`,
-//! built on `std.Io` primitives: `std.Io.Mutex` for synchronization and
-//! `std.Io.Clock` for time. Methods that lock or read the clock therefore take
-//! an `io: std.Io` handle (sourced from `HttpRequest.io` at request time).
+//! 镜像 Hical 的 `Session` / `SessionManager` / `makeSessionMiddleware`，
+//! 构建于 `std.Io` 原语之上：用 `std.Io.Mutex` 做同步，用 `std.Io.Clock`
+//! 取时间。因此会加锁或读时钟的方法都接收一个 `io: std.Io` 句柄
+//! （请求时来自 `HttpRequest.io`）。
 //!
-//! - `Session` stores string key/value pairs, tracks a dirty flag, and records
-//!   the last-access time.
-//! - `SessionManager` owns the session store, generates random 64-hex IDs,
-//!   enforces a maximum session count (DoS protection), and lazily
-//!   garbage-collects expired sessions.
-//! - `SessionMiddleware` integrates with the context-onion pipeline: it reads
-//!   the session cookie, finds or creates a session, attaches it to the request
-//!   as a pointer attribute, and writes a `Set-Cookie` header when the session
-//!   was created or modified.
+//! - `Session` 存储字符串键/值对，跟踪一个 dirty 标志，并记录最后访问时间。
+//! - `SessionManager` 拥有会话存储，生成随机的 64 位十六进制 ID，强制一个
+//!   会话数上限（DoS 防护），并惰性回收过期会话。
+//! - `SessionMiddleware` 与上下文洋葱管线集成：读取会话 cookie，查找或创建
+//!   会话，作为指针属性挂到请求上，并在会话被创建或修改时写一个
+//!   `Set-Cookie` 头。
 //!
-//! Session values are strings (user id, token, role). The manager owns all
-//! key/value memory and frees it on `destroy`/`deinit`.
+//! 会话值为字符串（用户 id、token、role）。管理器拥有所有键/值内存，并在
+//! `destroy`/`deinit` 时释放它们。
 
 const std = @import("std");
 const http = @import("http.zig");
 const middleware = @import("middleware.zig");
 
-/// Request pointer-attribute key under which the active `*Session` is stored.
+/// 存放当前 `*Session` 的请求指针属性键。
 pub const session_attribute_key = "zyra.session";
 
 fn nowNs(io: std.Io) i128 {
     return std.Io.Clock.now(.awake, io).nanoseconds;
 }
 
-/// A single session's data. Thread-safe via an `std.Io.Mutex`. The id is
-/// immutable after construction.
+/// 单个会话的数据。通过 `std.Io.Mutex` 实现线程安全。id 在构造后不可变。
 pub const Session = struct {
     id_buf: [64]u8,
     allocator: std.mem.Allocator,
@@ -56,13 +52,13 @@ pub const Session = struct {
         self.data.deinit(self.allocator);
     }
 
-    /// Session ID (immutable, no lock needed).
+    /// 会话 ID（不可变，无需加锁）。
     pub fn id(self: *const Session) []const u8 {
         return &self.id_buf;
     }
 
-    /// Sets a session attribute, duplicating both key and value. Marks the
-    /// session dirty so the middleware refreshes the cookie.
+    /// 设置一个会话属性，同时复制 key 和 value。标记会话为 dirty，以便中间件
+    /// 刷新 cookie。
     pub fn set(self: *Session, io: std.Io, key: []const u8, value: []const u8) !void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -84,8 +80,7 @@ pub const Session = struct {
         self.dirty = true;
     }
 
-    /// Returns a borrowed view of the value for `key`, valid until the value is
-    /// overwritten/removed. Returns null if absent.
+    /// 返回 `key` 对应值的借用视图，在该值被覆盖/移除前有效。不存在则返回 null。
     pub fn get(self: *Session, io: std.Io, key: []const u8) ?[]const u8 {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -108,7 +103,7 @@ pub const Session = struct {
         }
     }
 
-    /// Removes all attributes (does not destroy the session itself).
+    /// 移除所有属性（不会销毁会话本身）。
     pub fn clear(self: *Session, io: std.Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -127,15 +122,15 @@ pub const Session = struct {
         return self.dirty;
     }
 
-    /// Updates the last-access timestamp.
+    /// 更新最后访问时间戳。
     pub fn touch(self: *Session, io: std.Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.last_access_ns = nowNs(io);
     }
 
-    /// Moves all data from `other` into `self` (used during ID regeneration).
-    /// The caller holds the manager lock, so no per-session lock is taken.
+    /// 将 `other` 中的所有数据移动到 `self`（用于 ID 重新生成）。
+    /// 调用方持有管理器锁，因此这里不获取单会话锁。
     fn migrateFrom(self: *Session, other: *Session) void {
         self.data = other.data;
         other.data = .empty;
@@ -145,26 +140,25 @@ pub const Session = struct {
 
 pub const SessionOptions = struct {
     cookie_name: []const u8 = "ZYRA_SESSION",
-    /// Session lifetime in seconds.
+    /// 会话生命周期（秒）。
     max_age_seconds: i64 = 3600,
     http_only: bool = true,
     secure: bool = true,
     same_site: http.SameSite = .lax,
     path: []const u8 = "/",
-    /// Lazy GC interval in seconds: GC only runs if at least this many seconds
-    /// elapsed since the previous run.
+    /// 惰性 GC 间隔（秒）：仅当距上次运行至少过去这么多秒时才执行 GC。
     gc_interval_seconds: i64 = 300,
-    /// Maximum live sessions (0 = unlimited). Guards against memory exhaustion.
+    /// 最大存活会话数（0 = 无限）。用于防止内存耗尽。
     max_sessions: usize = 100_000,
 };
 
 pub const SessionError = error{
-    /// The session store reached `max_sessions`.
+    /// 会话存储已达到 `max_sessions`。
     SessionStoreFull,
 };
 
-/// Thread-safe in-memory session store. Typically a long-lived singleton shared
-/// with the server through `SessionMiddleware`.
+/// 线程安全的内存会话存储。通常是一个通过 `SessionMiddleware` 与服务器共享的
+/// 长生命周期单例。
 pub const SessionManager = struct {
     allocator: std.mem.Allocator,
     options: SessionOptions,
@@ -194,8 +188,7 @@ pub const SessionManager = struct {
         return age_ns > max_ns;
     }
 
-    /// Looks up a session by ID. Returns null if missing or expired (an expired
-    /// session is removed as a side effect).
+    /// 按 ID 查找会话。缺失或过期则返回 null（过期会话会作为副作用被移除）。
     pub fn find(self: *SessionManager, io: std.Io, id: []const u8) ?*Session {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -207,8 +200,8 @@ pub const SessionManager = struct {
         return session;
     }
 
-    /// Creates a new session with a fresh random ID. Returns
-    /// `SessionError.SessionStoreFull` when the store is at capacity.
+    /// 创建一个带全新随机 ID 的会话。当存储已满时返回
+    /// `SessionError.SessionStoreFull`。
     pub fn create(self: *SessionManager, io: std.Io) !*Session {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -232,7 +225,7 @@ pub const SessionManager = struct {
         return session;
     }
 
-    /// Destroys the session with the given ID (e.g. on logout).
+    /// 销毁给定 ID 的会话（例如登出时）。
     pub fn destroy(self: *SessionManager, io: std.Io, id: []const u8) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -246,9 +239,8 @@ pub const SessionManager = struct {
         }
     }
 
-    /// Regenerates a session's ID while preserving its data (defends against
-    /// session-fixation attacks). The old ID is invalidated immediately.
-    /// Returns the session under its new ID, or null if `old_id` was unknown.
+    /// 在保留数据的同时重新生成会话 ID（防御会话固定攻击）。旧 ID 会立即失效。
+    /// 返回新 ID 下的会话；若 `old_id` 未知则返回 null。
     pub fn regenerate(self: *SessionManager, io: std.Io, old_id: []const u8) !?*Session {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -265,8 +257,8 @@ pub const SessionManager = struct {
         return new_session;
     }
 
-    /// Removes expired sessions. With `force = false` it is a no-op unless at
-    /// least `gc_interval_seconds` elapsed since the previous run.
+    /// 移除过期会话。当 `force = false` 时，若距上次运行未经过至少
+    /// `gc_interval_seconds`，则不执行任何操作。
     pub fn gc(self: *SessionManager, io: std.Io, force: bool) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -312,8 +304,8 @@ pub const SessionManager = struct {
     }
 };
 
-/// Context-onion session middleware. Construct with `init(manager)` and register
-/// via `attach(server)` or `server.useOnionCtx(&mw, SessionMiddleware.handle)`.
+/// 上下文洋葱会话中间件。用 `init(manager)` 构造，并通过 `attach(server)` 或
+/// `server.useOnionCtx(&mw, SessionMiddleware.handle)` 注册。
 pub const SessionMiddleware = struct {
     manager: *SessionManager,
 
@@ -355,7 +347,7 @@ pub const SessionMiddleware = struct {
 
         var response = try next.run(req);
 
-        // Refresh the cookie when the session is new or was modified.
+        // 当会话是新的或被修改过时刷新 cookie。
         if (active.isDirty(io) or !had_valid_cookie) {
             try response.setCookie(opts.cookie_name, active.id(), .{
                 .max_age_seconds = opts.max_age_seconds,
@@ -369,15 +361,14 @@ pub const SessionMiddleware = struct {
     }
 };
 
-/// Convenience accessor: retrieves the active `*Session` from a request, or null
-/// if the session middleware did not run.
+/// 便捷访问器：从请求中取回当前 `*Session`；如果会话中间件未运行则返回 null。
 pub fn fromRequest(req: *const http.HttpRequest) ?*Session {
     const ptr = req.getAttributePtr(session_attribute_key) orelse return null;
     return @ptrCast(@alignCast(ptr));
 }
 
 // ----------------------------------------------------------------------------
-// Tests (driven by a single-threaded zio runtime, since std.Io.Mutex needs io)
+// 测试（由单线程 zio 运行时驱动，因为 std.Io.Mutex 需要 io）
 // ----------------------------------------------------------------------------
 
 const zio = @import("zio");
@@ -498,7 +489,7 @@ test "expired sessions are evicted on find" {
             var id_buf: [64]u8 = undefined;
             @memcpy(&id_buf, s.id());
 
-            // Force the last-access timestamp far into the past.
+            // 强制把最后访问时间戳调到很久以前。
             s.last_access_ns = nowNs(io) - 5 * std.time.ns_per_s;
 
             try std.testing.expect(mgr.find(io, &id_buf) == null);

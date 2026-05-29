@@ -1,48 +1,44 @@
-//! Cross-Origin Resource Sharing (CORS) middleware.
+//! 跨源资源共享（CORS）中间件。
 //!
-//! Mirrors Hical's `makeCorsMiddleware` behaviour using Zyra's context-carrying
-//! onion middleware (no heap closures):
+//! 使用 Zyra 携带上下文的洋葱中间件（无堆闭包）镜像 Hical 的
+//! `makeCorsMiddleware` 行为：
 //!
-//! - No `Origin` header                  -> pass through, no CORS headers added
-//! - `Origin` not in the allow-list      -> pass through, no CORS headers added
-//! - OPTIONS preflight (with the
-//!   `Access-Control-Request-Method` header) -> respond 204 with the full set of
-//!   preflight headers; `next` is not called
-//! - Any other cross-origin request      -> call `next`, then append the simple
-//!   CORS response headers
-//! - `allow_credentials = true`          -> echo the concrete origin instead of
-//!   `*` (a wildcard with credentials is rejected at `init` time)
-//! - Non-wildcard mode                   -> append `Vary: Origin`
+//! - 无 `Origin` 头                         -> 透传，不添加 CORS 头
+//! - `Origin` 不在允许列表中                 -> 透传，不添加 CORS 头
+//! - OPTIONS 预检（带 `Access-Control-Request-Method` 头）
+//!                                           -> 响应 204 和完整预检头；不调用 `next`
+//! - 其他跨源请求                            -> 调用 `next`，再追加简单 CORS 响应头
+//! - `allow_credentials = true`              -> 回显具体 origin 而非 `*`
+//!                                              （带凭据的通配符会在 `init` 时被拒绝）
+//! - 非通配符模式                            -> 追加 `Vary: Origin`
 
 const std = @import("std");
 const http = @import("http.zig");
 const middleware = @import("middleware.zig");
 
 pub const CorsOptions = struct {
-    /// Allowed origins. `&.{"*"}` allows every origin; otherwise origins are
-    /// matched exactly.
+    /// 允许的源。`&.{"*"}` 允许任意源；否则逐字匹配源。
     allowed_origins: []const []const u8 = &.{"*"},
-    /// Allowed HTTP methods, advertised on preflight responses.
+    /// 允许的 HTTP 方法，会在预检响应中声明。
     allowed_methods: []const []const u8 = &.{ "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS" },
-    /// Allowed request headers, advertised on preflight responses.
+    /// 允许的请求头，会在预检响应中声明。
     allowed_headers: []const []const u8 = &.{ "Content-Type", "Authorization" },
-    /// Response headers exposed to the client on actual responses.
+    /// 在实际响应中暴露给客户端的响应头。
     expose_headers: []const []const u8 = &.{},
-    /// Whether the browser may send credentials (cookies, auth headers).
+    /// 浏览器是否可以发送凭据（cookie、认证头）。
     allow_credentials: bool = false,
-    /// Preflight cache lifetime, in seconds.
+    /// 预检缓存生命周期（秒）。
     max_age_seconds: u32 = 86400,
 };
 
 pub const CorsError = error{
-    /// `allow_credentials = true` combined with a `*` origin is insecure and
-    /// therefore rejected.
+    /// `allow_credentials = true` 与 `*` origin 组合是不安全的，因此会被拒绝。
     CredentialsWithWildcardOrigin,
 };
 
-/// CORS middleware. Stores pre-joined header strings so request handling avoids
-/// re-allocating on every call. Construct with `init`, then register with
-/// `attach(server)` or `server.useOnionCtx(&cors, Cors.handle)`.
+/// CORS 中间件。存储预先拼接好的头字符串，使请求处理避免每次调用都重新分配。
+/// 用 `init` 构造，再用 `attach(server)` 或
+/// `server.useOnionCtx(&cors, Cors.handle)` 注册。
 pub const Cors = struct {
     options: CorsOptions,
     methods_csv: []u8,
@@ -93,7 +89,7 @@ pub const Cors = struct {
         self.allocator.free(self.expose_csv);
     }
 
-    /// Registers this CORS middleware on `server`. `self` must outlive `server`.
+    /// 在 `server` 上注册该 CORS 中间件。`self` 的生命周期必须长于 `server`。
     pub fn attach(self: *Cors, server: anytype) !void {
         try server.useOnionCtx(self, handle);
     }
@@ -116,7 +112,7 @@ pub const Cors = struct {
         }
     }
 
-    /// Context-onion entry point. Cast `ctx` back to `*Cors`.
+    /// 上下文洋葱入口点。把 `ctx` 转回 `*Cors`。
     pub fn handle(ctx: *anyopaque, req: *http.HttpRequest, next: *middleware.Next) anyerror!http.HttpResponse {
         const self: *Cors = @ptrCast(@alignCast(ctx));
 
@@ -130,14 +126,14 @@ pub const Cors = struct {
             return next.run(req);
         }
 
-        // With credentials, the spec forbids `*`; echo the concrete origin.
+        // 带凭据时，规范禁止 `*`；回显具体 origin。
         const allow_origin: []const u8 = if (self.options.allow_credentials or !self.is_wildcard)
             origin_value
         else
             "*";
 
-        // Preflight = OPTIONS plus an Access-Control-Request-Method header. A
-        // bare OPTIONS request is routed normally.
+        // 预检 = OPTIONS 加 Access-Control-Request-Method 头。裸 OPTIONS 请求
+        // 正常路由。
         const req_method = req.header("Access-Control-Request-Method");
         const is_preflight = req.method == .options and req_method != null and req_method.?.len > 0;
 

@@ -1,25 +1,24 @@
-//! Compile-time Zig type -> OpenAPI 3.0.3 JSON Schema reflection.
+//! 编译期 Zig 类型 -> OpenAPI 3.0.3 JSON Schema 反射。
 //!
-//! `writeSchema(w, T)` emits an inline JSON Schema object for the Zig type `T`
-//! directly into a `std.json.Stringify` writer. No `$ref`/`components` indirection
-//! is used; every schema is fully expanded in place. The mapping is:
+//! `writeSchema(w, T)` 会把 Zig 类型 `T` 的内联 JSON Schema 对象直接输出到
+//! `std.json.Stringify` writer。不会使用 `$ref`/`components` 间接引用；每个
+//! schema 都会在原处完全展开。映射如下：
 //!
 //!   - `bool`                 -> {"type":"boolean"}
-//!   - integer types          -> {"type":"integer","format":"int32|int64"}
-//!   - float types            -> {"type":"number","format":"float|double"}
-//!   - `[]const u8`, `[N]u8`  -> {"type":"string"}            (byte strings)
-//!   - other slices/arrays    -> {"type":"array","items":<schema>}
-//!   - `?T`                   -> <schema of T> + "nullable":true
-//!   - `enum`                 -> {"type":"string","enum":[...tag names]}
+//!   - 整数类型               -> {"type":"integer","format":"int32|int64"}
+//!   - 浮点类型               -> {"type":"number","format":"float|double"}
+//!   - `[]const u8`, `[N]u8`  -> {"type":"string"}            （字节字符串）
+//!   - 其他切片/数组          -> {"type":"array","items":<schema>}
+//!   - `?T`                   -> <T 的 schema> + "nullable":true
+//!   - `enum`                 -> {"type":"string","enum":[...标签名]}
 //!   - `struct`               -> {"type":"object","properties":{...},"required":[...]}
 //!
-//! Optional struct fields are omitted from the `required` array. Pointers to a
-//! single item are transparently followed. Unsupported types fail at compile
-//! time so an incomplete schema can never be emitted at runtime.
+//! 可选结构体字段会从 `required` 数组中省略。单项指针会被透明跟随。不支持的类型
+//! 会在编译期失败，因此运行时永远不会输出不完整的 schema。
 
 const std = @import("std");
 
-/// Emits the JSON Schema for `T` into `w`. Comptime-recursive over the type.
+/// 将 `T` 的 JSON Schema 输出到 `w`。对类型做编译期递归。
 pub fn writeSchema(w: *std.json.Stringify, comptime T: type) !void {
     try writeSchemaInner(w, T, false);
 }
@@ -53,7 +52,7 @@ fn writeSchemaInner(w: *std.json.Stringify, comptime T: type, comptime nullable:
             try w.endObject();
         },
         .optional => |opt| {
-            // Collapse `?T` into T's schema with nullable set.
+            // 将 `?T` 折叠为 T 的 schema，并设置 nullable。
             try writeSchemaInner(w, opt.child, true);
         },
         .@"enum" => |enum_info| {
@@ -73,7 +72,7 @@ fn writeSchemaInner(w: *std.json.Stringify, comptime T: type, comptime nullable:
             switch (ptr.size) {
                 .slice => {
                     if (ptr.child == u8) {
-                        // `[]const u8` / `[]u8` are treated as strings.
+                        // `[]const u8` / `[]u8` 视为字符串。
                         try w.beginObject();
                         try w.objectField("type");
                         try w.write("string");
@@ -84,7 +83,7 @@ fn writeSchemaInner(w: *std.json.Stringify, comptime T: type, comptime nullable:
                     }
                 },
                 .one => {
-                    // Transparently follow single-item pointers.
+                    // 透明跟随单项指针。
                     try writeSchemaInner(w, ptr.child, nullable);
                 },
                 else => @compileError("openapi schema: unsupported pointer size for " ++ @typeName(T)),
@@ -114,7 +113,7 @@ fn writeSchemaInner(w: *std.json.Stringify, comptime T: type, comptime nullable:
             }
             try w.endObject();
 
-            // Non-optional fields are required.
+            // 非可选字段是必需字段。
             comptime var required_count = 0;
             inline for (struct_info.fields) |field| {
                 if (@typeInfo(field.type) != .optional) required_count += 1;
@@ -153,10 +152,10 @@ fn writeNullable(w: *std.json.Stringify) !void {
 }
 
 // ----------------------------------------------------------------------------
-// Tests
+// 测试
 // ----------------------------------------------------------------------------
 
-/// Renders `T`'s schema to an owned JSON string for assertions.
+/// 将 `T` 的 schema 渲染为自有 JSON 字符串以供断言。
 fn renderSchema(allocator: std.mem.Allocator, comptime T: type) ![]const u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
@@ -258,7 +257,7 @@ test "struct with required and optional fields" {
     try std.testing.expect(props.get("nickname").?.object.get("nullable").?.bool);
     try std.testing.expectEqualStrings("boolean", props.get("active").?.object.get("type").?.string);
 
-    // required excludes the optional `nickname`.
+    // required 排除可选的 `nickname`。
     const required = root.get("required").?.array;
     try std.testing.expectEqual(@as(usize, 3), required.items.len);
     for (required.items) |item| {
