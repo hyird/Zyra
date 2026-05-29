@@ -30,7 +30,18 @@ Implemented web-facing Hical-style API surface includes:
   `setBody`, `bodyText`, `jsonValue`, `setJsonBody`, `badRequest`, `redirect`,
   `setCookie`, and 416 range error factory
 - server limit setters for body/header size and max connections
+- middleware: synchronous onion model via `MiddlewarePipeline`
+  (`use`/`useOnion`/`useBeforeAfter`), with `MiddlewareHandler`, `BeforeHandler`,
+  `AfterHandler`, and `Next`
+- multipart: RFC 7578 form parsing via `multipart.parse`, with `getFile`,
+  `getField`, and `extractBoundary`
+- static files: `StaticFiles` serving with MIME types, ETag/`If-None-Match`
+  (304), byte-range requests (206/416), and path-traversal protection
+- OpenAPI: `OpenApiDocument` builds an OpenAPI 3.0.3 JSON document from
+  registered operations (path params surfaced automatically)
+- WebSocket: RFC 6455 frame codec (`websocket.Frame` encode/decode with
+  masking) and handshake key derivation (`websocket.computeAcceptKey`)
 
-Not implemented yet: WebSocket, SSL/TLS, OpenAPI, static files, multipart, and
-database/logging modules. Idle timeout, graceful shutdown, and GC interval APIs
-are intentionally not exposed until they are fully implemented.
+Not implemented yet: SSL/TLS and database/logging modules. Idle timeout,
+graceful shutdown, and GC interval APIs are intentionally not exposed until they
+are fully implemented.

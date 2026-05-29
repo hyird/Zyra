@@ -108,6 +108,9 @@ pub const HttpRequest = struct {
     content_type: ?[]const u8 = null,
     content_length: ?u64 = null,
     keep_alive: bool = true,
+    /// Runtime I/O handle, set by the server. Available to handlers that need
+    /// file or socket I/O (e.g. static file serving). Null in unit tests.
+    io: ?std.Io = null,
     inline_params: [max_inline_params]Param = undefined,
     inline_param_count: u8 = 0,
     overflow_params: Params = .{},
@@ -395,6 +398,13 @@ pub const HttpResponse = struct {
         const value = std.fmt.bufPrint(&response.content_range_buffer, "bytes */{d}", .{file_size}) catch unreachable;
         response.content_range_len = @intCast(value.len);
         return response;
+    }
+
+    /// Sets a satisfied `Content-Range: bytes start-end/total` header (used for
+    /// 206 Partial Content responses).
+    pub fn setContentRange(self: *HttpResponse, start: u64, end: u64, total: u64) void {
+        const value = std.fmt.bufPrint(&self.content_range_buffer, "bytes {d}-{d}/{d}", .{ start, end, total }) catch unreachable;
+        self.content_range_len = @intCast(value.len);
     }
 
     pub fn statusCode(self: *const HttpResponse) HttpStatus {

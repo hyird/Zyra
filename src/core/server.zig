@@ -52,6 +52,18 @@ pub const HttpServer = struct {
         try self.middleware_.use(middleware);
     }
 
+    pub fn useOnion(self: *HttpServer, middleware: @import("middleware.zig").MiddlewareHandler) !void {
+        try self.middleware_.useOnion(middleware);
+    }
+
+    pub fn useBeforeAfter(
+        self: *HttpServer,
+        before: @import("middleware.zig").BeforeHandler,
+        after: ?@import("middleware.zig").AfterHandler,
+    ) !void {
+        try self.middleware_.useBeforeAfter(before, after);
+    }
+
     pub fn setMaxBodySize(self: *HttpServer, bytes: usize) void {
         self.options.max_request_body_size = bytes;
     }
@@ -158,6 +170,7 @@ pub const HttpServer = struct {
 
             var request = http.HttpRequest.initRaw(arena.allocator(), &raw_request) catch return;
             defer request.deinit();
+            request.io = io;
 
             if (request.content_length) |content_length| {
                 if (content_length > self.options.max_request_body_size) {
