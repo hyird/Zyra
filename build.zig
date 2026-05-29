@@ -16,22 +16,40 @@ pub fn build(b: *std.Build) void {
     });
     zyra_mod.addImport("zio", zio_dep.module("zio"));
 
-    const demo = b.addExecutable(.{
-        .name = "zyra-demo",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/basic.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    demo.root_module.addImport("zyra", zyra_mod);
-    demo.root_module.addImport("zio", zio_dep.module("zio"));
-    b.installArtifact(demo);
+    // 所有示例程序：每个对应一个可执行文件和一个 `run-<名字>` 步骤，
+    // 其中 basic 额外绑定到默认的 `run` 步骤。
+    const Example = struct {
+        name: []const u8,
+        src: []const u8,
+        step: []const u8,
+        desc: []const u8,
+    };
+    const examples = [_]Example{
+        .{ .name = "zyra-demo", .src = "examples/basic.zig", .step = "run", .desc = "运行最小示例服务器" },
+        .{ .name = "zyra-routing", .src = "examples/routing.zig", .step = "run-routing", .desc = "运行路由示例（参数/路由组/声明式路由）" },
+        .{ .name = "zyra-static", .src = "examples/static.zig", .step = "run-static", .desc = "运行带缓存的静态文件示例" },
+        .{ .name = "zyra-json", .src = "examples/json_api.zig", .step = "run-json", .desc = "运行带类型 JSON API + OpenAPI 示例" },
+        .{ .name = "zyra-middleware", .src = "examples/middleware.zig", .step = "run-middleware", .desc = "运行中间件/CORS/会话示例" },
+        .{ .name = "zyra-logging", .src = "examples/logging.zig", .step = "run-logging", .desc = "运行异步文件日志 + 请求日志示例" },
+    };
+    for (examples) |example| {
+        const exe = b.addExecutable(.{
+            .name = example.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(example.src),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addImport("zyra", zyra_mod);
+        exe.root_module.addImport("zio", zio_dep.module("zio"));
+        b.installArtifact(exe);
 
-    const run_demo = b.addRunArtifact(demo);
-    if (b.args) |args| run_demo.addArgs(args);
-    const run_step = b.step("run", "Run the basic Zyra demo server");
-    run_step.dependOn(&run_demo.step);
+        const run_exe = b.addRunArtifact(exe);
+        if (b.args) |args| run_exe.addArgs(args);
+        const run_step = b.step(example.step, example.desc);
+        run_step.dependOn(&run_exe.step);
+    }
 
     const tests = b.addTest(.{
         .root_module = b.createModule(.{

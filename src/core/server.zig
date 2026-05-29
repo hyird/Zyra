@@ -67,6 +67,11 @@ pub const HttpServer = struct {
     /// (`getJson`/`postJson`/...). Used by `enableOpenApi` to emit reflected
     /// request/response schemas.
     typed_routes: std.ArrayListUnmanaged(TypedRouteRecord) = .empty,
+    /// 可选的启动钩子：在 `start` 内部、zio 运行时已就绪且开始 accept
+    /// *之前*被调用一次，并拿到运行时的 `std.Io`。用于初始化需要 io 的
+    /// 资源（如 `FileSink`/`AsyncFileSink` 日志 sink）。`ctx` 原样回传。
+    on_ready_ctx: ?*anyopaque = null,
+    on_ready_fn: ?*const fn (?*anyopaque, Io) anyerror!void = null,
 
     pub fn init(allocator: std.mem.Allocator, options: ServerOptions) HttpServer {
         return .{
@@ -235,6 +240,9 @@ pub const HttpServer = struct {
         // `await` (not `cancel`) the group so active requests finish draining.
         var group: Io.Group = .init;
 
+        // 在开始 accept 之前运行启动钩子，让用户初始化依赖 io 的资源。
+        if (self.on_ready_fn) |hook| try hook(self.on_ready_ctx, io);
+
         self.accepting.store(true, .release);
 
         // Run the accept loop concurrently so the calling fiber can wait for the
@@ -249,6 +257,18 @@ pub const HttpServer = struct {
         self.accepting.store(false, .release);
         _ = accept_future.cancel(io);
         group.await(io) catch {};
+    }
+
+    /// 注册一个启动钩子：在运行时就绪、开始 accept 之前，于 zio 运行时
+    /// 的 fiber 上下文中以 `(ctx, io)` 调用一次。返回错误会使 `start`
+    /// 失败。典型用途是 open 并 start 依赖 io 的日志 sink。
+    pub fn onReady(
+        self: *HttpServer,
+        ctx: ?*anyopaque,
+        handler: *const fn (?*anyopaque, Io) anyerror!void,
+    ) void {
+        self.on_ready_ctx = ctx;
+        self.on_ready_fn = handler;
     }
 
     /// Requests a graceful shutdown: stops accepting new connections and lets
@@ -880,4 +900,41 @@ test "respondWithIo streams a file-backed body over loopback" {
 
     try std.testing.expect(state.status_ok);
     try std.testing.expect(state.body_ok);
+}
+
+// --- onReady startup hook -------------------------------------------------
+
+const OnReadyState = struct {
+    called: bool = false,
+    io_was_usable: bool = false,
+};
+
+test "onReady hook runs inside the runtime before accepting" {
+    var server = HttpServer.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+
+    var state = OnReadyState{};
+    // 钩子在 accept 之前运行；为了让 start 能返回，钩子内通过 ctx 拿到
+    // server 并请求关闭。这里用一个包装把 server 与 state 一起传入。
+    const HookCtx = struct {
+        server: *HttpServer,
+        state: *OnReadyState,
+        fn run(ctx: ?*anyopaque, io: Io) anyerror!void {
+            const c: *@This() = @ptrCast(@alignCast(ctx.?));
+            c.state.called = true;
+            _ = std.Io.Clock.now(.awake, io).nanoseconds;
+            c.state.io_was_usable = true;
+            // 预置关闭信号：钩子返回后 start 开始 accept，随即在 shutdown
+            // 事件上立刻被唤醒并干净返回。
+            c.server.requestShutdown(io);
+        }
+    };
+    var hook_ctx = HookCtx{ .server = &server, .state = &state };
+    server.onReady(&hook_ctx, HookCtx.run);
+
+    try server.start();
+
+    try std.testing.expect(state.called);
+    try std.testing.expect(state.io_was_usable);
+    try std.testing.expect(!server.isAccepting());
 }
