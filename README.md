@@ -39,7 +39,9 @@ Implemented web-facing Hical-style API surface includes:
 - multipart: RFC 7578 form parsing via `multipart.parse`, with `getFile`,
   `getField`, and `extractBoundary`
 - static files: `StaticFiles` serving with MIME types, ETag/`If-None-Match`
-  (304), byte-range requests (206/416), and path-traversal protection
+  (304), byte-range requests (206/416), and path-traversal protection. File
+  bodies are streamed from disk in fixed-size chunks (`HttpResponse.FileBody` +
+  `respondWithIo`), so large files are sent with constant memory.
 - OpenAPI: `OpenApiDocument` builds an OpenAPI 3.0.3 JSON document from
   registered operations (path params surfaced automatically). Call
   `server.enableOpenApi(.{ .title = ... })` after registering routes to

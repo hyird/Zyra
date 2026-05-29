@@ -417,7 +417,7 @@ pub const HttpServer = struct {
 
             var response = self.middleware_.execute(&self.router_, &request) catch http.HttpResponse.serverError();
             response.keep_alive = keep_alive;
-            response.respond(&raw_request) catch |err| switch (err) {
+            response.respondWithIo(&raw_request, io) catch |err| switch (err) {
                 error.WriteFailed => return cancelOrClose(writer.err),
                 else => return,
             };
@@ -756,4 +756,128 @@ test "requestShutdown stops accepting and drains in-flight handlers" {
     // The request was served and the server is no longer accepting.
     try std.testing.expectEqual(http.HttpStatus.ok, state.served_status orelse return error.NoResponse);
     try std.testing.expect(!server.isAccepting());
+}
+
+// --- FileBody streaming end-to-end ---------------------------------------
+
+const FileBodyTestState = struct {
+    io: Io,
+    port: u16 = 0,
+    ready: std.atomic.Value(bool) = .init(false),
+    file_path: []const u8,
+    file_len: u64,
+    body_ok: bool = false,
+    status_ok: bool = false,
+    err: ?anyerror = null,
+};
+
+/// Accepts one loopback connection, receives the request head, and replies with
+/// a file-backed body via `respondWithIo`.
+fn fileBodyServerMain(state: *FileBodyTestState) anyerror!void {
+    const io = state.io;
+
+    const addr = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    state.port = listener.socket.address.getPort();
+    state.ready.store(true, .release);
+
+    const stream = try listener.accept(io);
+    defer stream.close(io);
+
+    var rbuf: [4096]u8 = undefined;
+    var reader = zio.net.Stream.Reader.fromStd(stream, io, &rbuf);
+    var wbuf: [4096]u8 = undefined;
+    var writer = zio.net.Stream.Writer.fromStd(stream, io, &wbuf);
+    var raw_server = std.http.Server.init(&reader.interface, &writer.interface);
+
+    var raw_request = try raw_server.receiveHead();
+    const res = http.HttpResponse.fileBody(.ok, "text/plain", state.file_path, 0, state.file_len);
+    try res.respondWithIo(&raw_request, io);
+}
+
+fn fileBodyClientMain(state: *FileBodyTestState) anyerror!void {
+    const io = state.io;
+    while (!state.ready.load(.acquire)) {
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+
+    const addr = try Io.net.IpAddress.parseIp4("127.0.0.1", state.port);
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var wbuf: [256]u8 = undefined;
+    var writer = stream.writer(io, &wbuf);
+    try writer.interface.writeAll("GET /file HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    try writer.interface.flush();
+
+    var rbuf: [4096]u8 = undefined;
+    var reader = stream.reader(io, &rbuf);
+    var acc: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < acc.len) {
+        const n = reader.interface.readSliceShort(acc[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    const response = acc[0..total];
+    if (std.mem.indexOf(u8, response, "200") != null) state.status_ok = true;
+    // Body follows the blank line; the file content is "Hello, FileBody!".
+    if (std.mem.indexOf(u8, response, "Hello, FileBody!") != null) state.body_ok = true;
+}
+
+fn fileBodyTestRoot(state: *FileBodyTestState) anyerror!void {
+    const io = state.io;
+    var group: Io.Group = .init;
+    const Wrap = struct {
+        fn server(s: *FileBodyTestState) Io.Cancelable!void {
+            fileBodyServerMain(s) catch |e| {
+                if (s.err == null) s.err = e;
+            };
+        }
+        fn client(s: *FileBodyTestState) Io.Cancelable!void {
+            fileBodyClientMain(s) catch |e| {
+                if (s.err == null) s.err = e;
+            };
+        }
+    };
+    try group.concurrent(io, Wrap.server, .{state});
+    try group.concurrent(io, Wrap.client, .{state});
+    group.await(io) catch {};
+    if (state.err) |e| return e;
+}
+
+fn fileBodyTestMain(state: *FileBodyTestState) Io.Cancelable!void {
+    fileBodyTestRoot(state) catch |e| {
+        if (state.err == null) state.err = e;
+    };
+}
+
+test "respondWithIo streams a file-backed body over loopback" {
+    var runtime = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+    const io = runtime.io();
+
+    const payload = "Hello, FileBody!";
+    const path = "zig-cache-zyra-filebody-smoke.txt";
+
+    // Create the temp file using the same std.Io backend respondWithIo reads.
+    {
+        var dir = std.Io.Dir.cwd();
+        var f = try dir.createFile(io, path, .{});
+        try f.writePositionalAll(io, payload, 0);
+        f.close(io);
+    }
+    defer {
+        var dir = std.Io.Dir.cwd();
+        dir.deleteFile(io, path) catch {};
+    }
+
+    var state = FileBodyTestState{ .io = io, .file_path = path, .file_len = payload.len };
+    var root = io.async(fileBodyTestMain, .{&state});
+    root.await(io) catch {};
+    if (state.err) |e| return e;
+
+    try std.testing.expect(state.status_ok);
+    try std.testing.expect(state.body_ok);
 }

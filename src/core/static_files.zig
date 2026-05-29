@@ -190,10 +190,9 @@ pub const StaticFiles = struct {
                 switch (parseByteRange(range_header, file_size)) {
                     .unsatisfiable => return http.HttpResponse.rangeNotSatisfiable(file_size),
                     .range => |r| {
-                        const len: usize = @intCast(r.end - r.start + 1);
-                        const buf = try allocator.alloc(u8, len);
-                        const read = file.readPositionalAll(io, buf, r.start) catch return http.HttpResponse.serverError();
-                        var res = http.HttpResponse{ .status = .partial_content, .body = buf[0..read], .content_type = mime };
+                        const len: u64 = r.end - r.start + 1;
+                        // Stream the requested range from disk (constant memory).
+                        var res = http.HttpResponse.fileBody(.partial_content, mime, disk_path, r.start, len);
                         res.setContentRange(r.start, r.end, file_size);
                         try res.setHeader("accept-ranges", "bytes");
                         try res.setHeader("etag", etag_owned);
@@ -205,10 +204,8 @@ pub const StaticFiles = struct {
             }
         }
 
-        // Full 200 response.
-        const buf = try allocator.alloc(u8, @intCast(file_size));
-        const read = file.readPositionalAll(io, buf, 0) catch return http.HttpResponse.serverError();
-        var res = http.HttpResponse{ .status = .ok, .body = buf[0..read], .content_type = mime };
+        // Full 200 response, streamed from disk in chunks (constant memory).
+        var res = http.HttpResponse.fileBody(.ok, mime, disk_path, 0, file_size);
         try res.setHeader("accept-ranges", "bytes");
         try res.setHeader("etag", etag_owned);
         try res.setHeader("x-content-type-options", "nosniff");
@@ -262,11 +259,13 @@ const SmokeState = struct {
     arena: std.mem.Allocator,
     err: ?anyerror = null,
     full_status: http.HttpStatus = .internal_server_error,
-    full_body: []const u8 = "",
+    full_len: u64 = 0,
+    full_path: []const u8 = "",
     full_etag: []const u8 = "",
     notmod_status: http.HttpStatus = .internal_server_error,
     range_status: http.HttpStatus = .internal_server_error,
-    range_body: []const u8 = "",
+    range_offset: u64 = 0,
+    range_len: u64 = 0,
     range_content_range_present: bool = false,
     notfound_status: http.HttpStatus = .ok,
 };
@@ -306,7 +305,10 @@ fn smokeImpl(state: *SmokeState) anyerror!void {
     };
     const full = try sf.serve(&req_full);
     state.full_status = full.status;
-    state.full_body = full.body;
+    if (full.file) |fb| {
+        state.full_len = fb.length;
+        state.full_path = fb.path;
+    }
     state.full_etag = full.header("etag") orelse "";
 
     // 304 Not Modified using the returned ETag.
@@ -332,7 +334,10 @@ fn smokeImpl(state: *SmokeState) anyerror!void {
     try req_rg.addHeader("range", "bytes=0-4");
     const rg = try sf.serve(&req_rg);
     state.range_status = rg.status;
-    state.range_body = rg.body;
+    if (rg.file) |fb| {
+        state.range_offset = fb.offset;
+        state.range_len = fb.length;
+    }
     state.range_content_range_present = rg.content_range_len > 0;
 
     // 404 for a missing file.
@@ -370,13 +375,15 @@ test "static files end-to-end serve 200 304 206 404" {
     if (state.err) |err| return err;
 
     try std.testing.expectEqual(http.HttpStatus.ok, state.full_status);
-    try std.testing.expectEqualStrings("Hello, Zyra!", state.full_body);
+    try std.testing.expectEqual(@as(u64, 12), state.full_len); // "Hello, Zyra!"
+    try std.testing.expect(state.full_path.len > 0);
     try std.testing.expect(state.full_etag.len > 0);
 
     try std.testing.expectEqual(http.HttpStatus.not_modified, state.notmod_status);
 
     try std.testing.expectEqual(http.HttpStatus.partial_content, state.range_status);
-    try std.testing.expectEqualStrings("Hello", state.range_body);
+    try std.testing.expectEqual(@as(u64, 0), state.range_offset);
+    try std.testing.expectEqual(@as(u64, 5), state.range_len); // bytes=0-4
     try std.testing.expect(state.range_content_range_present);
 
     try std.testing.expectEqual(http.HttpStatus.not_found, state.notfound_status);

@@ -389,6 +389,20 @@ pub const HttpResponse = struct {
     inline_cookie_count: u8 = 0,
     content_range_buffer: [64]u8 = undefined,
     content_range_len: u8 = 0,
+    /// When set, the response body is streamed from a file on disk instead of
+    /// `body`. The file is opened and read in chunks at send time (see
+    /// `respondWithIo`), so large files do not need to be buffered in memory.
+    file: ?FileBody = null,
+
+    /// A file-backed response body. The framing layer opens `path` (relative to
+    /// the current working directory) at send time, seeks to `offset`, and
+    /// streams exactly `length` bytes. `path` must remain valid until the
+    /// response is sent (request-arena lifetime is sufficient).
+    pub const FileBody = struct {
+        path: []const u8,
+        offset: u64 = 0,
+        length: u64,
+    };
 
     pub fn ok(body: []const u8) HttpResponse {
         return .{ .body = body };
@@ -427,6 +441,17 @@ pub const HttpResponse = struct {
 
     pub fn serverError() HttpResponse {
         return .{ .status = .internal_server_error, .body = "Internal Server Error" };
+    }
+
+    /// Builds a response whose body is streamed from `path` at send time,
+    /// covering `length` bytes starting at `offset`. Use `.partial_content` for
+    /// 206 range responses and `.ok` for full-file responses.
+    pub fn fileBody(status: HttpStatus, content_type: []const u8, path: []const u8, offset: u64, length: u64) HttpResponse {
+        return .{
+            .status = status,
+            .content_type = content_type,
+            .file = .{ .path = path, .offset = offset, .length = length },
+        };
     }
 
     pub fn redirect(location: []const u8, status: HttpStatus) HttpResponse {
@@ -513,6 +538,57 @@ pub const HttpResponse = struct {
     pub fn respond(self: HttpResponse, raw: *std.http.Server.Request) !void {
         var headers_buf: [24]Header = undefined;
         var cookie_values: [max_inline_cookies][256]u8 = undefined;
+        const headers = self.buildHeaders(&headers_buf, &cookie_values);
+        try raw.respond(self.body, .{
+            .status = self.status.toStd(),
+            .keep_alive = self.keep_alive,
+            .extra_headers = headers,
+        });
+    }
+
+    /// Like `respond`, but if `file` is set the body is streamed from disk in
+    /// chunks (constant memory) instead of being buffered. Requires `io`.
+    /// Falls back to `respond` when there is no file body.
+    pub fn respondWithIo(self: HttpResponse, raw: *std.http.Server.Request, io: std.Io) !void {
+        const fb = self.file orelse return self.respond(raw);
+
+        var headers_buf: [24]Header = undefined;
+        var cookie_values: [max_inline_cookies][256]u8 = undefined;
+        const headers = self.buildHeaders(&headers_buf, &cookie_values);
+
+        var dir = std.Io.Dir.cwd();
+        var file = dir.openFile(io, fb.path, .{}) catch return error.FileOpenFailed;
+        defer file.close(io);
+
+        // Stream the body with an explicit content-length equal to the range.
+        var send_buf: [64 * 1024]u8 = undefined;
+        var body_writer = try raw.respondStreaming(&send_buf, .{
+            .content_length = fb.length,
+            .respond_options = .{
+                .status = self.status.toStd(),
+                .keep_alive = self.keep_alive,
+                .extra_headers = headers,
+            },
+        });
+
+        // HEAD requests elide the body; skip the file work entirely.
+        if (!body_writer.isEliding() and fb.length > 0) {
+            var read_buf: [64 * 1024]u8 = undefined;
+            var reader = file.reader(io, &read_buf);
+            reader.seekTo(fb.offset) catch return error.FileReadFailed;
+            reader.interface.streamExact64(&body_writer.writer, fb.length) catch
+                return error.FileReadFailed;
+        }
+        try body_writer.end();
+    }
+
+    /// Assembles the response header list (content-type, inline/extra headers,
+    /// content-range, and set-cookie) into the caller-provided buffers.
+    fn buildHeaders(
+        self: *const HttpResponse,
+        headers_buf: *[24]Header,
+        cookie_values: *[max_inline_cookies][256]u8,
+    ) []const Header {
         var count: usize = 0;
         headers_buf[count] = .{ .name = "content-type", .value = self.content_type };
         count += 1;
@@ -536,11 +612,7 @@ pub const HttpResponse = struct {
             headers_buf[count] = .{ .name = "set-cookie", .value = value };
             count += 1;
         }
-        try raw.respond(self.body, .{
-            .status = self.status.toStd(),
-            .keep_alive = self.keep_alive,
-            .extra_headers = headers_buf[0..count],
-        });
+        return headers_buf[0..count];
     }
 };
 
