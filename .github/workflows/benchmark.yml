@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+env:
+  ZIG_VERSION: 0.16.0
+  # SHA-256 of zig-x86_64-linux-0.16.0.tar.xz (from ziglang.org/download).
+  ZIG_SHA256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+
 jobs:
   benchmark-zyra:
     runs-on: ubuntu-24.04
@@ -19,17 +24,53 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Zig 0.16.0
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-
       - name: Install benchmark dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
             wrk \
-            curl
+            xz-utils
+
+      # Cache the downloaded + extracted Zig toolchain, keyed on the version.
+      # On a hit this skips the ziglang.org download entirely.
+      - name: Cache Zig toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.zig-toolchain
+          key: zig-toolchain-${{ runner.os }}-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          set -euo pipefail
+          ZIG_DIR="$HOME/.zig-toolchain"
+          ZIG_NAME="zig-x86_64-linux-${ZIG_VERSION}"
+          if [ ! -x "$ZIG_DIR/$ZIG_NAME/zig" ]; then
+            mkdir -p "$ZIG_DIR"
+            TARBALL="${ZIG_NAME}.tar.xz"
+            curl -fsSL -o "$TARBALL" \
+              "https://ziglang.org/download/${ZIG_VERSION}/${TARBALL}"
+            echo "${ZIG_SHA256}  ${TARBALL}" | sha256sum --check --status
+            tar -xJf "$TARBALL" -C "$ZIG_DIR"
+            rm -f "$TARBALL"
+          fi
+          echo "$ZIG_DIR/$ZIG_NAME" >> "$GITHUB_PATH"
+
+      - name: Verify Zig
+        run: zig version
+
+      # Cache Zig's global + local build caches (compiled std, dependencies,
+      # build artifacts) so incremental builds skip recompiling unchanged code.
+      - name: Cache Zig build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-build-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-build-${{ runner.os }}-${{ env.ZIG_VERSION }}-
 
       - name: Build Zyra
         run: |
@@ -124,7 +165,7 @@ jobs:
       - name: Install benchmark dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             cmake \
             ninja-build \
             gcc-14 \
@@ -134,6 +175,15 @@ jobs:
             zlib1g-dev \
             wrk \
             curl
+
+      - name: Cache Hical CMake build
+        uses: actions/cache@v4
+        with:
+          path: build/hical
+          # Invalidate when the Hical sources or build config change.
+          key: hical-build-${{ runner.os }}-${{ hashFiles('benchmark/hical/CMakeLists.txt', 'benchmark/hical/**/*.cpp') }}
+          restore-keys: |
+            hical-build-${{ runner.os }}-
 
       - name: Configure Hical benchmark
         env:
