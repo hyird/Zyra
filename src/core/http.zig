@@ -77,6 +77,7 @@ const max_inline_params = 8;
 const max_inline_headers = 16;
 const max_inline_response_headers = 16;
 const max_inline_cookies = 8;
+const streaming_body_threshold = 16 * 1024;
 
 pub const Param = struct {
     name: []const u8,
@@ -352,8 +353,8 @@ pub const HttpRequest = struct {
     }
 
     pub fn queryParam(self: *HttpRequest, name: []const u8) !?[]const u8 {
-        const params = try self.queryParams();
-        return params.get(name);
+        if (self.parsed_query_params) |*params| return params.get(name);
+        return findUrlEncodedParam(self.allocator, self.query(), name);
     }
 
     pub fn hasQueryParam(self: *HttpRequest, name: []const u8) !bool {
@@ -369,8 +370,9 @@ pub const HttpRequest = struct {
     }
 
     pub fn formParam(self: *HttpRequest, name: []const u8) !?[]const u8 {
-        const params = try self.formParams();
-        return params.get(name);
+        if (self.parsed_form_params) |*params| return params.get(name);
+        if (!self.hasFormUrlEncodedBody()) return null;
+        return findUrlEncodedParam(self.allocator, self.body_bytes, name);
     }
 
     pub fn hasFormParam(self: *HttpRequest, name: []const u8) !bool {
@@ -380,18 +382,17 @@ pub const HttpRequest = struct {
     pub fn formParams(self: *HttpRequest) !*const QueryParams {
         if (self.parsed_form_params == null) {
             self.parsed_form_params = .{};
-            if (self.contentType()) |ct| {
-                if (std.mem.indexOf(u8, ct, "application/x-www-form-urlencoded") != null) {
-                    try parseUrlEncoded(self.allocator, self.body_bytes, &self.parsed_form_params.?);
-                }
+            if (self.hasFormUrlEncodedBody()) {
+                try parseUrlEncoded(self.allocator, self.body_bytes, &self.parsed_form_params.?);
             }
         }
         return &self.parsed_form_params.?;
     }
 
     pub fn cookie(self: *HttpRequest, name: []const u8) !?[]const u8 {
-        const parsed = try self.cookies();
-        return parsed.get(name);
+        if (self.parsed_cookies) |*parsed| return parsed.get(name);
+        const cookie_header = self.header("cookie") orelse return null;
+        return findCookieValue(cookie_header, name);
     }
 
     pub fn hasCookie(self: *HttpRequest, name: []const u8) !bool {
@@ -411,6 +412,11 @@ pub const HttpRequest = struct {
             }
         }
         return &self.parsed_cookies.?;
+    }
+
+    fn hasFormUrlEncodedBody(self: *const HttpRequest) bool {
+        const ct = self.contentType() orelse return false;
+        return std.mem.indexOf(u8, ct, "application/x-www-form-urlencoded") != null;
     }
 
     pub fn setAttribute(self: *HttpRequest, key: []const u8, value: []const u8) !void {
@@ -607,6 +613,10 @@ pub const HttpResponse = struct {
     pub fn respond(self: HttpResponse, raw: *std.http.Server.Request) !void {
         if (self.hasSimpleHeaders()) {
             var headers: [1]Header = .{.{ .name = "content-type", .value = self.content_type }};
+            if (self.body.len >= streaming_body_threshold) {
+                try self.respondSliceStreaming(raw, &headers);
+                return;
+            }
             try raw.respond(self.body, .{
                 .status = self.status.toStd(),
                 .keep_alive = self.keep_alive,
@@ -618,6 +628,10 @@ pub const HttpResponse = struct {
         var headers_buf: [24]Header = undefined;
         var cookie_values: [max_inline_cookies][256]u8 = undefined;
         const headers = self.buildHeaders(&headers_buf, &cookie_values);
+        if (self.body.len >= streaming_body_threshold) {
+            try self.respondSliceStreaming(raw, headers);
+            return;
+        }
         try raw.respond(self.body, .{
             .status = self.status.toStd(),
             .keep_alive = self.keep_alive,
@@ -656,6 +670,22 @@ pub const HttpResponse = struct {
             reader.seekTo(fb.offset) catch return error.FileReadFailed;
             reader.interface.streamExact64(&body_writer.writer, fb.length) catch
                 return error.FileReadFailed;
+        }
+        try body_writer.end();
+    }
+
+    fn respondSliceStreaming(self: HttpResponse, raw: *std.http.Server.Request, headers: []const Header) !void {
+        var send_buf: [16 * 1024]u8 = undefined;
+        var body_writer = try raw.respondStreaming(&send_buf, .{
+            .content_length = self.body.len,
+            .respond_options = .{
+                .status = self.status.toStd(),
+                .keep_alive = self.keep_alive,
+                .extra_headers = headers,
+            },
+        });
+        if (!body_writer.isEliding() and self.body.len > 0) {
+            try body_writer.writer.writeAll(self.body);
         }
         try body_writer.end();
     }
@@ -762,6 +792,51 @@ fn parseUrlEncoded(allocator: std.mem.Allocator, input: []const u8, out: *QueryP
         const value = if (eq < pair.len) try percentDecode(allocator, pair[eq + 1 ..]) else "";
         try out.put(allocator, key, value);
     }
+}
+
+fn findUrlEncodedParam(allocator: std.mem.Allocator, input: []const u8, name: []const u8) !?[]const u8 {
+    var pairs = std.mem.splitScalar(u8, input, '&');
+    var found: ?[]const u8 = null;
+    while (pairs.next()) |pair| {
+        if (pair.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+        const key = pair[0..eq];
+        if (!urlEncodedKeyEql(key, name)) continue;
+        found = if (eq < pair.len) pair[eq + 1 ..] else "";
+    }
+    return if (found) |value| try percentDecode(allocator, value) else null;
+}
+
+fn urlEncodedKeyEql(encoded: []const u8, plain: []const u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < encoded.len and j < plain.len) {
+        const c = encoded[i];
+        if (c == '+') {
+            if (plain[j] != ' ') return false;
+            i += 1;
+        } else if (c == '%' and i + 2 < encoded.len) {
+            const decoded = std.fmt.parseInt(u8, encoded[i + 1 .. i + 3], 16) catch return false;
+            if (plain[j] != decoded) return false;
+            i += 3;
+        } else {
+            if (plain[j] != c) return false;
+            i += 1;
+        }
+        j += 1;
+    }
+    return i == encoded.len and j == plain.len;
+}
+
+fn findCookieValue(cookie_header: []const u8, name: []const u8) ?[]const u8 {
+    var parts = std.mem.splitScalar(u8, cookie_header, ';');
+    var found: ?[]const u8 = null;
+    while (parts.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t");
+        const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
+        if (std.mem.eql(u8, part[0..eq], name)) found = part[eq + 1 ..];
+    }
+    return found;
 }
 
 fn percentDecode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {

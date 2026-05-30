@@ -71,6 +71,9 @@ pub const Next = struct {
 pub const MiddlewarePipeline = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
+    /// `use()` 注册的纯 before 链占常见鉴权/限流场景。只要没有洋葱/上下文/
+    /// before_after，中间件执行就可以走无 `Next`、无 `switch` 的紧凑快路径。
+    before_only: bool = true,
 
     pub fn init(allocator: std.mem.Allocator) MiddlewarePipeline {
         return .{ .allocator = allocator };
@@ -87,6 +90,7 @@ pub const MiddlewarePipeline = struct {
 
     /// 注册一个完整的洋葱模型中间件，由它控制是否调用 `next`。
     pub fn useOnion(self: *MiddlewarePipeline, middleware: MiddlewareHandler) !void {
+        self.before_only = false;
         try self.entries.append(self.allocator, .{ .kind = .onion, .onion = middleware });
     }
 
@@ -98,6 +102,7 @@ pub const MiddlewarePipeline = struct {
         context: *anyopaque,
         handler: ContextHandler,
     ) !void {
+        self.before_only = false;
         try self.entries.append(self.allocator, .{
             .kind = .context,
             .context_handler = handler,
@@ -107,6 +112,7 @@ pub const MiddlewarePipeline = struct {
 
     /// 注册一对共享单个链帧的 before/after 钩子。
     pub fn useBeforeAfter(self: *MiddlewarePipeline, before: BeforeHandler, after: ?AfterHandler) !void {
+        self.before_only = false;
         try self.entries.append(self.allocator, .{ .kind = .before_after, .before = before, .after = after });
     }
 
@@ -116,6 +122,12 @@ pub const MiddlewarePipeline = struct {
 
     pub fn execute(self: *const MiddlewarePipeline, router: *const router_mod.Router, req: *http.HttpRequest) !http.HttpResponse {
         if (self.entries.items.len == 0) return router.dispatch(req);
+        if (self.before_only) {
+            for (self.entries.items) |entry| {
+                if (try entry.before.?(req)) |response| return response;
+            }
+            return router.dispatch(req);
+        }
         var next = Next{ .pipeline = self, .router = router };
         return next.run(req);
     }

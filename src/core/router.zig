@@ -23,6 +23,7 @@ pub const GroupMiddleware = struct {
 pub const WsHandler = *const fn (*websocket.WebSocketSession) anyerror!void;
 
 const method_count = @typeInfo(http.HttpMethod).@"enum".fields.len;
+const hot_static_route_count = 8;
 
 /// 一条已存储的路由：用户的处理函数，加上包裹它的（可能为空的）组级中间件
 /// 链。该中间件切片是借用的，必须比路由器存活更久（组中间件链由路由器的
@@ -66,6 +67,35 @@ const RouteEntry = struct {
     endpoint: RouteEndpoint,
 };
 
+const ParamCapture = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+const HotStaticRoutes = struct {
+    entries: [hot_static_route_count]RouteEntry = undefined,
+    len: u8 = 0,
+
+    fn put(self: *HotStaticRoutes, path: []const u8, endpoint: RouteEndpoint) void {
+        for (self.entries[0..self.len]) |*entry| {
+            if (std.mem.eql(u8, entry.path, path)) {
+                entry.endpoint = endpoint;
+                return;
+            }
+        }
+        if (self.len == hot_static_route_count) return;
+        self.entries[self.len] = .{ .path = path, .endpoint = endpoint };
+        self.len += 1;
+    }
+
+    fn get(self: *const HotStaticRoutes, path: []const u8) ?RouteEndpoint {
+        for (self.entries[0..self.len]) |entry| {
+            if (std.mem.eql(u8, entry.path, path)) return entry.endpoint;
+        }
+        return null;
+    }
+};
+
 pub const Router = struct {
     allocator: std.mem.Allocator,
     /// 根路径 `/` 是最常见的基准与健康检查路径。为每个方法保留一个直接
@@ -73,6 +103,10 @@ pub const Router = struct {
     /// 路由仍然同时存入 `static_routes`，因此 routeCount/forEachRoute/OpenAPI
     /// 等内省行为保持不变。
     root_routes: [method_count]?RouteEndpoint = .{null} ** method_count,
+    /// 前几个注册的非参数静态路由通常就是基准/健康检查/首页等热点。保存一个
+    /// 很小的线性热表，让命中时绕过哈希表计算；未命中最多比较 8 次，然后回退
+    /// 到完整 `static_routes`，因此内省与大路由表行为不变。
+    hot_static_routes: [method_count]HotStaticRoutes = .{HotStaticRoutes{}} ** method_count,
     static_routes: [method_count]std.StringHashMapUnmanaged(RouteEndpoint) = .{std.StringHashMapUnmanaged(RouteEndpoint).empty} ** method_count,
     param_routes: [method_count]std.ArrayListUnmanaged(RouteEntry) = .{std.ArrayListUnmanaged(RouteEntry).empty} ** method_count,
     path_methods: std.StringHashMapUnmanaged(u16) = .{},
@@ -105,16 +139,21 @@ pub const Router = struct {
     /// 用于附加组作用域的中间件；大多数调用方应改用 `route`/动词辅助函数。
     pub fn routeEndpoint(self: *Router, method: http.HttpMethod, path: []const u8, endpoint: RouteEndpoint) !void {
         const index = methodIndex(method);
+        const bit = methodBit(method);
+        const methods = try self.path_methods.getOrPut(self.allocator, path);
+        errdefer {
+            if (!methods.found_existing) _ = self.path_methods.remove(path);
+        }
+
         if (isParamPath(path)) {
             try self.param_routes[index].append(self.allocator, .{ .path = path, .endpoint = endpoint });
         } else {
-            if (isRootPath(path)) self.root_routes[index] = endpoint;
             try self.static_routes[index].put(self.allocator, path, endpoint);
+            if (isRootPath(path)) self.root_routes[index] = endpoint;
+            self.hot_static_routes[index].put(path, endpoint);
         }
 
-        const bit = methodBit(method);
-        const result = try self.path_methods.getOrPut(self.allocator, path);
-        result.value_ptr.* = if (result.found_existing) result.value_ptr.* | bit else bit;
+        methods.value_ptr.* = if (methods.found_existing) methods.value_ptr.* | bit else bit;
     }
 
     pub fn get(self: *Router, path: []const u8, handler: RouteHandler) !void {
@@ -201,25 +240,39 @@ pub const Router = struct {
     pub fn dispatch(self: *const Router, req: *http.HttpRequest) !http.HttpResponse {
         const index = methodIndex(req.method);
 
-        if (isRootPath(req.path)) {
-            if (self.root_routes[index]) |endpoint| return endpoint.invoke(req);
-        }
+        if (self.dispatchStatic(index, req)) |endpoint| return endpoint.invoke(req);
 
-        if (self.static_routes[index].get(req.path)) |endpoint| {
-            return endpoint.invoke(req);
-        }
-
-        for (self.param_routes[index].items) |entry| {
-            const checkpoint = req.paramCheckpoint();
-            if (try matchParamPath(entry.path, req.path, req)) return entry.endpoint.invoke(req);
-            req.rollbackParams(checkpoint);
-        }
+        if (try self.dispatchParam(index, req)) |endpoint| return endpoint.invoke(req);
 
         if (self.allowedMethods(req)) |allow| {
             return http.HttpResponse.methodNotAllowed(allow);
         }
 
         return http.HttpResponse.notFound();
+    }
+
+    fn dispatchStatic(self: *const Router, index: usize, req: *const http.HttpRequest) ?RouteEndpoint {
+
+        if (isRootPath(req.path)) {
+            if (self.root_routes[index]) |endpoint| return endpoint;
+        }
+
+        if (self.hot_static_routes[index].get(req.path)) |endpoint| return endpoint;
+
+        if (self.static_routes[index].get(req.path)) |endpoint| {
+            return endpoint;
+        }
+
+        return null;
+    }
+
+    fn dispatchParam(self: *const Router, index: usize, req: *http.HttpRequest) !?RouteEndpoint {
+        for (self.param_routes[index].items) |entry| {
+            const checkpoint = req.paramCheckpoint();
+            if (try matchParamPath(entry.path, req.path, req)) return entry.endpoint;
+            req.rollbackParams(checkpoint);
+        }
+        return null;
     }
 
     fn allowedMethods(self: *const Router, req: *const http.HttpRequest) ?[]const u8 {
@@ -287,10 +340,17 @@ pub const RouteGroup = struct {
 
     pub fn route(self: *RouteGroup, method: http.HttpMethod, path: []const u8, handler: RouteHandler) !void {
         const joined = try joinPath(self.router.allocator, self.prefix, path);
-        errdefer self.router.allocator.free(joined);
-        const middleware = try self.snapshotChain();
-        try self.router.routeEndpoint(method, joined, .{ .handler = handler, .middleware = middleware });
         try self.router.owned_paths.append(self.router.allocator, joined);
+        errdefer {
+            _ = self.router.owned_paths.pop();
+            self.router.allocator.free(joined);
+        }
+        const middleware = try self.snapshotChain();
+        errdefer if (middleware.len > 0) {
+            const chain = self.router.owned_chains.pop().?;
+            self.router.allocator.free(chain);
+        };
+        try self.router.routeEndpoint(method, joined, .{ .handler = handler, .middleware = middleware });
     }
 
     pub fn get(self: *RouteGroup, path: []const u8, handler: RouteHandler) !void {
@@ -331,6 +391,7 @@ pub const RouteGroup = struct {
         const joined = try joinPath(self.router.allocator, self.prefix, sub_prefix);
         errdefer self.router.allocator.free(joined);
         try self.router.owned_paths.append(self.router.allocator, joined);
+        errdefer _ = self.router.owned_paths.pop();
         var child: std.ArrayListUnmanaged(GroupMiddleware) = .empty;
         if (self.chain.items.len > 0) {
             try child.appendSlice(self.router.allocator, self.chain.items);
@@ -380,6 +441,8 @@ fn wildcardName(segment: []const u8) []const u8 {
 fn matchParamPath(pattern_raw: []const u8, path_raw: []const u8, req: *http.HttpRequest) !bool {
     var pattern = trimLeadingSlash(pattern_raw);
     var path = trimLeadingSlash(path_raw);
+    var captures: [32]ParamCapture = undefined;
+    var capture_count: usize = 0;
 
     while (pattern.len > 0 or path.len > 0) {
         const remainder = path;
@@ -390,7 +453,12 @@ fn matchParamPath(pattern_raw: []const u8, path_raw: []const u8, req: *http.Http
                 // 最后一段。
                 if (pattern.len != 0) return false;
                 const name = wildcardName(p);
-                if (name.len > 0) try req.setParam(name, remainder);
+                if (name.len > 0) {
+                    if (capture_count == captures.len) return error.TooManyParameters;
+                    captures[capture_count] = .{ .name = name, .value = remainder };
+                    capture_count += 1;
+                }
+                try commitCaptures(req, captures[0..capture_count]);
                 return true;
             }
         }
@@ -400,12 +468,19 @@ fn matchParamPath(pattern_raw: []const u8, path_raw: []const u8, req: *http.Http
         const p = p_seg.?;
         const r = r_seg.?;
         if (isParamSegment(p)) {
-            try req.setParam(p[1 .. p.len - 1], r);
+            if (capture_count == captures.len) return error.TooManyParameters;
+            captures[capture_count] = .{ .name = p[1 .. p.len - 1], .value = r };
+            capture_count += 1;
         } else if (!std.mem.eql(u8, p, r)) {
             return false;
         }
     }
+    try commitCaptures(req, captures[0..capture_count]);
     return true;
+}
+
+fn commitCaptures(req: *http.HttpRequest, captures: []const ParamCapture) !void {
+    for (captures) |capture| try req.setParam(capture.name, capture.value);
 }
 
 fn pathShapeMatches(pattern_raw: []const u8, path_raw: []const u8) bool {

@@ -247,12 +247,27 @@ pub const StaticFiles = struct {
                 break :blk null;
             };
             if (hit) |entry| {
-                const disk_path = try allocator.dupe(u8, entry.disk_path);
-                const etag_owned = try allocator.dupe(u8, entry.etag);
+                const disk_path = allocator.dupe(u8, entry.disk_path) catch |err| {
+                    cache.mutex.unlock(io);
+                    return err;
+                };
+                const etag_owned = allocator.dupe(u8, entry.etag) catch |err| {
+                    cache.mutex.unlock(io);
+                    return err;
+                };
                 cache.mutex.unlock(io);
-                return self.respondFor(req, disk_path, entry.file_size, etag_owned, entry.mime);
+
+                // Validate size/mtime before sending headers. This preserves the cache's
+                // path/mime/etag fast path for immutable assets, while avoiding stale 304s
+                // or broken Content-Length if a file is replaced inside the TTL window.
+                if (self.cachedEntryStillFresh(io, disk_path, entry.file_size, entry.mtime_ns)) {
+                    return self.respondFor(req, disk_path, entry.file_size, etag_owned, entry.mime);
+                }
+                self.cacheInvalidate(cache, io, effective_rel);
+                // Fall through and rebuild from the filesystem.
+            } else {
+                cache.mutex.unlock(io);
             }
-            cache.mutex.unlock(io);
         }
 
         // 缓存未命中（或无缓存）：从磁盘解析 + stat。
@@ -311,10 +326,15 @@ pub const StaticFiles = struct {
 
         // 就地刷新已有条目。
         if (cache.map.getPtr(rel)) |entry| {
+            const path_copy = cache.allocator.dupe(u8, disk_path) catch return;
+            const etag_copy = cache.allocator.dupe(u8, etag) catch {
+                cache.allocator.free(path_copy);
+                return;
+            };
             cache.allocator.free(entry.disk_path);
             cache.allocator.free(entry.etag);
-            entry.disk_path = cache.allocator.dupe(u8, disk_path) catch return;
-            entry.etag = cache.allocator.dupe(u8, etag) catch return;
+            entry.disk_path = path_copy;
+            entry.etag = etag_copy;
             entry.file_size = file_size;
             entry.mtime_ns = mtime_ns;
             entry.mime = mime;
@@ -350,6 +370,26 @@ pub const StaticFiles = struct {
             cache.allocator.free(path_copy);
             cache.allocator.free(etag_copy);
         };
+    }
+
+    fn cachedEntryStillFresh(self: StaticFiles, io: std.Io, disk_path: []const u8, file_size: u64, mtime_ns: i128) bool {
+        _ = self;
+        var dir = std.Io.Dir.cwd();
+        var file = dir.openFile(io, disk_path, .{}) catch return false;
+        defer file.close(io);
+        const stat = file.stat(io) catch return false;
+        return stat.kind != .directory and stat.size == file_size and @as(i128, @intCast(stat.mtime.nanoseconds)) == mtime_ns;
+    }
+
+    fn cacheInvalidate(self: StaticFiles, cache: *PathCache, io: std.Io, rel: []const u8) void {
+        _ = self;
+        cache.mutex.lockUncancelable(io);
+        defer cache.mutex.unlock(io);
+        if (cache.map.fetchRemove(rel)) |kv| {
+            cache.allocator.free(kv.key);
+            var value = kv.value;
+            cache.freeEntry(&value);
+        }
     }
 
     /// 根据已解析的元数据构建实际的 HTTP 响应（304 / 206 / 200）。
