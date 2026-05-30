@@ -1,4 +1,4 @@
-name: Benchmark — Zyra vs Hical
+name: Benchmark — Zyra vs Hical vs Drogon
 
 on:
   workflow_dispatch:
@@ -275,12 +275,127 @@ jobs:
           name: benchmark-hical
           path: benchmarks/hical.json
 
+  benchmark-drogon:
+    runs-on: ubuntu-24.04
+    name: Benchmark Drogon
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install benchmark dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            ninja-build \
+            g++ \
+            libdrogon-dev \
+            wrk \
+            curl
+
+      - name: Cache Drogon CMake build
+        uses: actions/cache@v4
+        with:
+          path: build/drogon
+          key: drogon-build-${{ runner.os }}-${{ hashFiles('benchmark/drogon/CMakeLists.txt', 'benchmark/drogon/**/*.cpp') }}
+          restore-keys: |
+            drogon-build-${{ runner.os }}-
+
+      - name: Configure Drogon benchmark
+        run: |
+          cmake -S benchmark/drogon -B build/drogon -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Drogon benchmark
+        run: |
+          START=$(date +%s%N)
+          cmake --build build/drogon --config Release
+          END=$(date +%s%N)
+          echo "DROGON_BUILD_MS=$(( (END - START) / 1000000 ))" >> "$GITHUB_ENV"
+
+      - name: Measure Drogon binary
+        run: |
+          DROGON_BIN="build/drogon/drogon_benchmark_server"
+          DROGON_SIZE=$(du -sh "$DROGON_BIN" | cut -f1)
+          DROGON_BYTES=$(stat --format=%s "$DROGON_BIN")
+          echo "DROGON_BIN=$DROGON_BIN" >> "$GITHUB_ENV"
+          echo "DROGON_SIZE=$DROGON_SIZE" >> "$GITHUB_ENV"
+          echo "DROGON_BYTES=$DROGON_BYTES" >> "$GITHUB_ENV"
+
+      - name: Load test Drogon
+        run: |
+          set -euo pipefail
+
+          "$DROGON_BIN" --port 3002 --threads 2 &
+          DROGON_PID=$!
+          trap 'kill $DROGON_PID 2>/dev/null || true' EXIT
+
+          for i in $(seq 1 50); do
+            if curl -fsS http://127.0.0.1:3002/ >/dev/null; then
+              break
+            fi
+            sleep 0.2
+          done
+
+          DROGON_RSS_BEFORE=$(ps -o rss= -p "$DROGON_PID" | tr -d ' ')
+          WRK_OUT=$(wrk -t2 -c100 -d10s http://127.0.0.1:3002/)
+          echo "$WRK_OUT"
+          DROGON_RSS_AFTER=$(ps -o rss= -p "$DROGON_PID" | tr -d ' ')
+
+          DROGON_RSS_KB=$(( DROGON_RSS_BEFORE > DROGON_RSS_AFTER ? DROGON_RSS_BEFORE : DROGON_RSS_AFTER ))
+          DROGON_RAM_MB=$(awk "BEGIN{printf \"%.1f\", $DROGON_RSS_KB / 1024}")
+          DROGON_RPS=$(echo "$WRK_OUT" | grep 'Requests/sec' | awk '{print $2}')
+          DROGON_LAT=$(echo "$WRK_OUT" | grep 'Latency' | awk '{print $2 " " $3}')
+
+          echo "DROGON_RPS=$DROGON_RPS" >> "$GITHUB_ENV"
+          echo "DROGON_LAT=$DROGON_LAT" >> "$GITHUB_ENV"
+          echo "DROGON_RAM_MB=$DROGON_RAM_MB" >> "$GITHUB_ENV"
+
+          kill "$DROGON_PID" 2>/dev/null || true
+          trap - EXIT
+
+      - name: Save Drogon benchmark JSON
+        run: |
+          mkdir -p benchmarks
+          python3 << 'PYEOF'
+          import json, os, time
+
+          data = {
+              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "runner": "ubuntu-24.04",
+              "tool": "wrk -t2 -c100 -d10s",
+              "drogon": {
+                  "url": "http://127.0.0.1:3002/",
+                  "requests_per_sec": float(os.environ.get("DROGON_RPS", "0")),
+                  "avg_latency": os.environ.get("DROGON_LAT", ""),
+                  "ram_mb": float(os.environ.get("DROGON_RAM_MB", "0")),
+                  "build_time_ms": int(os.environ.get("DROGON_BUILD_MS", "0")),
+                  "binary_size": os.environ.get("DROGON_SIZE", ""),
+                  "binary_bytes": int(os.environ.get("DROGON_BYTES", "0")),
+              },
+          }
+
+          with open("benchmarks/drogon.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, indent=2)
+              f.write("\n")
+
+          print(json.dumps(data, indent=2))
+          PYEOF
+
+      - name: Upload Drogon benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-drogon
+          path: benchmarks/drogon.json
+
   summarize:
     runs-on: ubuntu-24.04
     name: Summarize benchmark results
     needs:
       - benchmark-zyra
       - benchmark-hical
+      - benchmark-drogon
 
     steps:
       - name: Download benchmark artifacts
@@ -300,6 +415,8 @@ jobs:
               zyra_data = json.load(f)
           with open("benchmarks/hical.json", "r", encoding="utf-8") as f:
               hical_data = json.load(f)
+          with open("benchmarks/drogon.json", "r", encoding="utf-8") as f:
+              drogon_data = json.load(f)
 
           data = {
               "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -307,6 +424,7 @@ jobs:
               "tool": "wrk -t2 -c100 -d10s",
               "zyra": zyra_data["zyra"],
               "hical": hical_data["hical"],
+              "drogon": drogon_data["drogon"],
           }
 
           Path("benchmarks").mkdir(exist_ok=True)
@@ -328,13 +446,14 @@ jobs:
 
           zyra = data["zyra"]
           hical = data["hical"]
+          drogon = data["drogon"]
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-              f.write("## 📊 Zyra vs Hical — Benchmark\n\n")
-              f.write("| Request metric | **Zyra** | **Hical** |\n")
-              f.write("|----------------|----------|-----------|\n")
-              f.write(f"| **Requests/sec** (wrk, 2t/100c/10s) | **{zyra['requests_per_sec']}** | **{hical['requests_per_sec']}** |\n")
-              f.write(f"| **Avg latency** | **{zyra['avg_latency']}** | **{hical['avg_latency']}** |\n\n")
+              f.write("## 📊 Zyra vs Hical vs Drogon — Benchmark\n\n")
+              f.write("| Request metric | **Zyra** | **Hical** | **Drogon** |\n")
+              f.write("|----------------|----------|-----------|------------|\n")
+              f.write(f"| **Requests/sec** (wrk, 2t/100c/10s) | **{zyra['requests_per_sec']}** | **{hical['requests_per_sec']}** | **{drogon['requests_per_sec']}** |\n")
+              f.write(f"| **Avg latency** | **{zyra['avg_latency']}** | **{hical['avg_latency']}** | **{drogon['avg_latency']}** |\n\n")
               f.write("> Measured on GitHub Actions `ubuntu-24.04`. Load test: `wrk -t2 -c100 -d10s` against `GET /`. Runtime-adjacent metrics such as binary size, build time, and RSS are intentionally excluded from the comparison table.\n")
           PYEOF
 
