@@ -290,9 +290,16 @@ jobs:
             cmake \
             ninja-build \
             g++ \
+            default-libmysqlclient-dev \
             libdrogon-dev \
+            libhiredis-dev \
             libjsoncpp-dev \
+            libpq-dev \
+            libsqlite3-dev \
+            libssl-dev \
+            libyaml-cpp-dev \
             uuid-dev \
+            zlib1g-dev \
             wrk \
             curl
 
