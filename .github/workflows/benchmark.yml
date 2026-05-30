@@ -290,7 +290,6 @@ jobs:
             cmake \
             ninja-build \
             g++ \
-            default-libmysqlclient-dev \
             libdrogon-dev \
             libhiredis-dev \
             libjsoncpp-dev \
