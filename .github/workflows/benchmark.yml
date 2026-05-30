@@ -291,6 +291,7 @@ jobs:
             ninja-build \
             g++ \
             libdrogon-dev \
+            libjsoncpp-dev \
             wrk \
             curl
 
