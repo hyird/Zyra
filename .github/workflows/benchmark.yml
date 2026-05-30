@@ -292,6 +292,7 @@ jobs:
             g++ \
             libdrogon-dev \
             libjsoncpp-dev \
+            uuid-dev \
             wrk \
             curl
 
