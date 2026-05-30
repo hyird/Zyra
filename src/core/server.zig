@@ -34,10 +34,6 @@ pub const ServerOptions = struct {
     /// zio 执行器（I/O 线程）数量。0 让 zio 根据 CPU 数量自动检测。
     /// Windows 被强制为单执行器，以避免跨 IOCP 的套接字 I/O。
     io_threads: usize = 0,
-    /// 监听同一地址的 acceptor 数量。大于 1 时每个 acceptor 都创建独立的
-    /// listener，并依赖 POSIX 上 `reuse_address` 同时启用的 SO_REUSEPORT 由
-    /// 内核分发新连接。Windows 强制为 1。
-    acceptors: usize = 1,
     max_request_header_size: usize = 64 * 1024,
     max_request_body_size: usize = 1024 * 1024,
     max_connections: usize = 10_000,
@@ -77,11 +73,6 @@ pub const HttpServer = struct {
     /// 将服务层错误统一映射为 HTTP 响应。未设置时保持默认 500。
     error_handler_ctx: ?*anyopaque = null,
     error_handler_fn: ?ErrorHandler = null,
-
-    const Acceptor = struct {
-        listener: Io.net.Server,
-        group: Io.Group = .init,
-    };
 
     pub fn init(allocator: std.mem.Allocator, options: ServerOptions) HttpServer {
         return .{
@@ -237,36 +228,15 @@ pub const HttpServer = struct {
         defer runtime.deinit();
 
         const io = runtime.io();
-        var bind_addr = try Io.net.IpAddress.parseIp4(self.options.host, self.options.port);
-        const acceptor_count = self.acceptorCount();
-        var acceptors = try self.allocator.alloc(Acceptor, acceptor_count);
-        defer self.allocator.free(acceptors);
+        const addr = try Io.net.IpAddress.parseIp4(self.options.host, self.options.port);
+        var listener = try addr.listen(io, .{ .reuse_address = true });
+        defer listener.deinit(io);
 
-        var initialized: usize = 0;
-        errdefer {
-            for (acceptors[0..initialized]) |*acceptor| acceptor.listener.deinit(io);
-        }
+        std.log.info("Zyra listening on {f}", .{listener.socket.address});
 
-        while (initialized < acceptors.len) : (initialized += 1) {
-            acceptors[initialized] = .{
-                .listener = try bind_addr.listen(io, .{ .reuse_address = true }),
-            };
-            if (initialized == 0) {
-                const actual_port = acceptors[0].listener.socket.address.getPort();
-                bind_addr.setPort(actual_port);
-                self.options.port = actual_port;
-            }
-        }
-        defer {
-            for (acceptors) |*acceptor| acceptor.listener.deinit(io);
-        }
-
-        std.log.info("Zyra listening on {f} with {} acceptor(s)", .{ acceptors[0].listener.socket.address, acceptor_count });
-
-        // accept loops 独立成组，关闭时取消该组以停止接收新连接；每个
-        // acceptor 拥有自己的连接处理 group，避免多个 accept loop 并发写入
-        // 同一个 Io.Group。关闭时对连接 group 执行 `await` 排空活跃请求。
-        var accept_group: Io.Group = .init;
+        // 进行中的连接处理函数存活在这个 group 中。关闭时我们对该 group
+        // 执行 `await`（而非 `cancel`），让活跃请求完成排空。
+        var group: Io.Group = .init;
 
         // 在开始 accept 之前运行启动钩子，让用户初始化依赖 io 的资源。
         if (self.on_ready_fn) |hook| try hook(self.on_ready_ctx, io);
@@ -274,19 +244,16 @@ pub const HttpServer = struct {
         self.accepting.store(true, .release);
 
         // 并发运行 accept 循环，使调用方 fiber 可以等待关闭信号。当该信号
-        // 到来时取消所有 accept 循环，从而在其下一个取消点中断阻塞的
-        // `accept`。
-        for (acceptors) |*acceptor| {
-            accept_group.async(io, HttpServer.acceptLoop, .{ self, io, &acceptor.listener, &acceptor.group });
-        }
+        // 到来时取消 accept 循环，从而在其下一个取消点中断阻塞的 `accept`。
+        var accept_future = io.async(HttpServer.acceptLoop, .{ self, io, &listener, &group });
 
         // 阻塞直到请求优雅关闭（若从不请求则一直阻塞）。
         self.shutdown_event.waitUncancelable(io);
 
         // 停止接收新连接，然后排空已在运行的处理函数。
         self.accepting.store(false, .release);
-        accept_group.cancel(io);
-        for (acceptors) |*acceptor| acceptor.group.await(io) catch {};
+        _ = accept_future.cancel(io);
+        group.await(io) catch {};
     }
 
     /// 注册一个启动钩子：在运行时就绪、开始 accept 之前，于 zio 运行时
@@ -323,12 +290,8 @@ pub const HttpServer = struct {
     /// accept 循环，作为可取消任务运行。取消（由 `requestShutdown` 触发）
     /// 表现为 `accept` 返回 `error.Canceled`，从而结束循环且不再接收连接。
     fn acceptLoop(self: *HttpServer, io: Io, listener: *Io.net.Server, group: *Io.Group) void {
-        while (self.isAccepting()) {
+        while (true) {
             const stream = listener.accept(io) catch return;
-            if (!self.isAccepting()) {
-                stream.close(io);
-                return;
-            }
             if (!self.tryAcquireConnection()) {
                 stream.close(io);
                 continue;
@@ -361,11 +324,6 @@ pub const HttpServer = struct {
         _ = self.active_connections.fetchSub(1, .acq_rel);
     }
 
-    fn acceptorCount(self: *const HttpServer) usize {
-        if (builtin.os.tag == .windows) return 1;
-        return @min(@max(self.options.acceptors, 1), max_acceptors);
-    }
-
     /// 解析 zio 执行器配置。Windows 被强制为单执行器；其他平台上
     /// `io_threads == 0` 交给 zio 的 CPU 自动检测（`.auto`），任何其他值
     /// 原样使用（钳制到运行时支持的范围内）。
@@ -377,7 +335,6 @@ pub const HttpServer = struct {
     }
 
     const max_executors = 64;
-    const max_acceptors = 64;
     const inline_read_buffer_size = 64 * 1024;
     const inline_write_buffer_size = 4096;
 
@@ -562,8 +519,6 @@ test "HttpServer configuration API without sockets" {
     try expectEqual(@as(usize, 1024 * 1024), server.options.max_request_body_size);
     try expectEqual(@as(usize, 64 * 1024), server.options.max_request_header_size);
     try expectEqual(@as(usize, 10_000), server.options.max_connections);
-    try expectEqual(@as(usize, 1), server.options.acceptors);
-    try expectEqual(@as(usize, 1), server.acceptorCount());
     // 空闲超时默认禁用（无限等待）。
     try expectEqual(@as(u64, 0), server.options.idle_timeout_ms);
 
@@ -619,27 +574,6 @@ test "executorOption honors platform and io_threads" {
         // 显式值原样使用，钳制到支持的范围内。
         try std.testing.expectEqual(ExecutorCount.exact(4), fixed_server.executorOption());
         try std.testing.expectEqual(ExecutorCount.exact(HttpServer.max_executors), huge_server.executorOption());
-    }
-}
-
-test "acceptorCount honors platform and option bounds" {
-    var zero_server = HttpServer.init(std.testing.allocator, .{ .acceptors = 0 });
-    defer zero_server.deinit();
-
-    var fixed_server = HttpServer.init(std.testing.allocator, .{ .acceptors = 2 });
-    defer fixed_server.deinit();
-
-    var huge_server = HttpServer.init(std.testing.allocator, .{ .acceptors = 9999 });
-    defer huge_server.deinit();
-
-    if (builtin.os.tag == .windows) {
-        try std.testing.expectEqual(@as(usize, 1), zero_server.acceptorCount());
-        try std.testing.expectEqual(@as(usize, 1), fixed_server.acceptorCount());
-        try std.testing.expectEqual(@as(usize, 1), huge_server.acceptorCount());
-    } else {
-        try std.testing.expectEqual(@as(usize, 1), zero_server.acceptorCount());
-        try std.testing.expectEqual(@as(usize, 2), fixed_server.acceptorCount());
-        try std.testing.expectEqual(@as(usize, HttpServer.max_acceptors), huge_server.acceptorCount());
     }
 }
 

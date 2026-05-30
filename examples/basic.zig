@@ -14,7 +14,6 @@ pub fn main() !void {
     var server = zyra.HttpServer.init(std.heap.smp_allocator, .{
         .port = 3000,
         .io_threads = 2,
-        .acceptors = 2,
     });
     defer server.deinit();
 

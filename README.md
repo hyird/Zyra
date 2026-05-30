@@ -43,11 +43,6 @@ zig build run-logging     # 异步文件日志（AsyncFileSink，经 onReady 启
   `setBody`、`bodyText`、`jsonValue`、`setJsonBody`、`badRequest`、`redirect`、
   `setCookie`，以及 416 范围错误工厂
 - 服务器限制设置器：请求体/请求头大小和最大连接数
-- acceptor 配置：`ServerOptions.acceptors` 控制同一地址上的 accept loop 数量。
-  默认 1；POSIX 上大于 1 时创建多个独立 listener，并通过 `reuse_address`
-  启用的 `SO_REUSEPORT` 让内核分发新连接；Windows 强制为 1。benchmark 示例
-  使用 `io_threads = 2` / `acceptors = 2` 在数量上对齐 Hical 的 2 IO 线程配置；
-  该选项不承诺 acceptor 与 zio executor/thread 绑定
 - 全局错误处理器：`server.setErrorHandler(ctx, handler)` 将业务 handler 或
   中间件返回的 `error` 统一映射为 HTTP 响应；未设置时默认返回 500。handler
   形如 `fn(?*anyopaque, *HttpRequest, anyerror) anyerror!HttpResponse`，因此
@@ -130,8 +125,8 @@ zig build run-logging     # 异步文件日志（AsyncFileSink，经 onReady 启
   竞速实现，因此在 epoll/io_uring 就绪模型下都能正确触发，且不需要额外
   的协程
 - 优雅关闭：`server.requestShutdown(io)`（线程安全）会通知 accept 循环
-  停止接收新连接；随后 `start` 会取消所有 accept loop，并在返回前通过
-  `Io.Group.await` 排空进行中的处理函数。`server.isAccepting()` 报告是否仍在接收新连接
+  停止接收新连接；随后 `start` 会在返回前通过 `Io.Group.await` 排空进行中
+  的处理函数。`server.isAccepting()` 报告是否仍在接收新连接
 - 启动钩子：`server.onReady(ctx, fn)` 注册一个在 zio 运行时就绪、开始
   accept *之前* 调用一次的回调，并拿到运行时的 `std.Io`。它用于初始化
   依赖 io 的资源——例如打开并启动 `FileSink`/`AsyncFileSink` 日志 sink
