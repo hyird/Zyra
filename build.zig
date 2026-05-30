@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const zio_backend: ?[]const u8 = if (target.result.os.tag == .linux) "epoll" else null;
+    const zio_backend = b.option([]const u8, "zio-backend", "Override zio backend (for example: epoll, io_uring)");
 
     const zio_dep = b.dependency("zio", .{
         .target = target,
