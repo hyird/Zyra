@@ -3,10 +3,12 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const zio_backend: ?[]const u8 = if (target.result.os.tag == .linux) "epoll" else null;
 
     const zio_dep = b.dependency("zio", .{
         .target = target,
         .optimize = optimize,
+        .backend = zio_backend,
     });
 
     const zyra_mod = b.addModule("zyra", .{
