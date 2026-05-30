@@ -290,6 +290,7 @@ jobs:
             cmake \
             ninja-build \
             g++ \
+            libbrotli-dev \
             libdrogon-dev \
             libhiredis-dev \
             libjsoncpp-dev \
