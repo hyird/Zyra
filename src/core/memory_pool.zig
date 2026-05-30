@@ -23,7 +23,7 @@ pub const MemoryPool = struct {
 /// 避免为无分配的请求付出建立成本。
 pub const RequestArena = struct {
     /// 栈上回退缓冲区大小：小于此值的分配尽量走栈，不碰堆。
-    const initial_size = 4096;
+    const initial_size = 1024;
 
     backing: std.mem.Allocator,
     fallback: std.heap.StackFallbackAllocator(initial_size) = undefined,

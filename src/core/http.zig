@@ -74,7 +74,7 @@ pub const Attributes = std.StringArrayHashMapUnmanaged([]const u8);
 pub const PtrAttributes = std.StringArrayHashMapUnmanaged(*anyopaque);
 
 const max_inline_params = 8;
-const max_inline_headers = 64;
+const max_inline_headers = 16;
 const max_inline_response_headers = 16;
 const max_inline_cookies = 8;
 
@@ -118,6 +118,8 @@ pub const HttpRequest = struct {
     overflow_params: Params = .{},
     headers: [max_inline_headers]Header = undefined,
     header_count: u8 = 0,
+    overflow_headers: std.ArrayListUnmanaged(Header) = .empty,
+    raw_request: ?*const std.http.Server.Request = null,
     body_bytes: []const u8 = "",
     parsed_query_params: ?QueryParams = null,
     parsed_form_params: ?QueryParams = null,
@@ -193,8 +195,10 @@ pub const HttpRequest = struct {
             raw.head.transfer_encoding == .chunked or
             (raw.head.content_length orelse 0) > 0;
 
-        // 无 body：借用原缓冲，恒等重定位，零分配。
-        // 有 body：复制一份独立副本，切片重定位到副本。
+        // 无 body：借用原缓冲，恒等重定位，零分配，并延迟 header 遍历到
+        // 用户实际调用 `header()` 时。
+        // 有 body：复制一份独立副本，切片重定位到副本，并立即物化 headers，
+        // 避免读取 body 覆盖 head_buffer 后悬垂。
         const head: []const u8 = if (has_body) try allocator.dupe(u8, original) else original;
 
         // 把一个借用自 `original` 的切片重定位到 `head` 的同一偏移上。
@@ -218,18 +222,22 @@ pub const HttpRequest = struct {
             .content_type = if (raw.head.content_type) |ct| Reloc.slice(original, head, ct) else null,
             .content_length = raw.head.content_length,
             .keep_alive = raw.head.keep_alive,
+            .raw_request = if (has_body) null else raw,
         };
-        var iter = raw.iterateHeaders();
-        while (iter.next()) |entry| {
-            const name = Reloc.slice(original, head, entry.name);
-            const value = Reloc.slice(original, head, entry.value);
-            try request.addHeader(name, value);
+        if (has_body) {
+            var iter = raw.iterateHeaders();
+            while (iter.next()) |entry| {
+                const name = Reloc.slice(original, head, entry.name);
+                const value = Reloc.slice(original, head, entry.value);
+                try request.addHeader(name, value);
+            }
         }
         return request;
     }
 
     pub fn deinit(self: *HttpRequest) void {
         self.overflow_params.deinit(self.allocator);
+        self.overflow_headers.deinit(self.allocator);
         if (self.parsed_query_params) |*params| params.deinit(self.allocator);
         if (self.parsed_form_params) |*params| params.deinit(self.allocator);
         if (self.parsed_cookies) |*cookies_| cookies_.deinit(self.allocator);
@@ -238,14 +246,26 @@ pub const HttpRequest = struct {
     }
 
     pub fn addHeader(self: *HttpRequest, name: []const u8, value: []const u8) !void {
-        if (self.header_count >= max_inline_headers) return error.TooManyHeaders;
-        self.headers[self.header_count] = .{ .name = name, .value = value };
-        self.header_count += 1;
+        if (self.header_count < max_inline_headers) {
+            self.headers[self.header_count] = .{ .name = name, .value = value };
+            self.header_count += 1;
+            return;
+        }
+        try self.overflow_headers.append(self.allocator, .{ .name = name, .value = value });
     }
 
     pub fn header(self: *const HttpRequest, name: []const u8) ?[]const u8 {
         for (self.headers[0..self.header_count]) |entry| {
             if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
+        }
+        for (self.overflow_headers.items) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
+        }
+        if (self.raw_request) |raw| {
+            var iter = raw.iterateHeaders();
+            while (iter.next()) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
+            }
         }
         return null;
     }
@@ -893,6 +913,22 @@ test "request headers params and rollback" {
     req.rollbackParams(checkpoint);
     try std.testing.expect(req.param("two") == null);
     try std.testing.expect(req.hasParam("one"));
+}
+
+test "request headers overflow beyond inline storage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var req = HttpRequest.initParsed(arena.allocator(), "GET", "/", null, null, true);
+    defer req.deinit();
+
+    var i: usize = 0;
+    while (i < max_inline_headers) : (i += 1) {
+        try req.addHeader("X-Fill", "v");
+    }
+    try req.addHeader("X-Overflow", "ok");
+
+    try std.testing.expectEqualStrings("ok", req.header("x-overflow").?);
 }
 
 test "request typed path param accessors" {

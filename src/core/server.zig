@@ -384,17 +384,18 @@ pub const HttpServer = struct {
         // 完成的竞争（无额外协程），这是在 epoll/io_uring 就绪模型下唯一
         // 真正会触发的超时机制。
         const idle_timeout = self.idleTimeout();
+        const has_idle_timeout = idle_timeout != .none;
         const has_middleware = self.middleware_.size() != 0;
         const has_websocket_routes = self.router_.hasWebSocketRoutes();
 
         while (true) {
-            reader.setTimeout(idle_timeout);
+            if (has_idle_timeout) reader.setTimeout(idle_timeout);
             var raw_request = raw_server.receiveHead() catch |err| switch (err) {
                 error.ReadFailed => return cancelOrClose(reader.err),
                 error.HttpConnectionClosing => return,
                 else => return,
             };
-            reader.setTimeout(.none);
+            if (has_idle_timeout) reader.setTimeout(.none);
             const keep_alive = raw_request.head.keep_alive;
 
             // WebSocket 升级：若客户端请求升级，且本路径注册了处理函数，
