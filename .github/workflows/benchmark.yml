@@ -294,6 +294,8 @@ jobs:
             libdrogon-dev \
             libhiredis-dev \
             libjsoncpp-dev \
+            libmariadb-dev \
+            libmariadb-dev-compat \
             libpq-dev \
             libsqlite3-dev \
             libssl-dev \
